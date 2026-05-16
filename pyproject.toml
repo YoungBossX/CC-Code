@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-coder"
+version = "0.1.0"
+description = "CC-Coder is a lightweight terminal coding assistant for local development workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+cc-coder = "cc_code.main:main"
+cc-coder-gateway = "cc_code.gateway:run_gateway"
+cc-coder-cron = "cc_code.cron_runner:main"
+cc-coder-headless = "cc_code.headless:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+
