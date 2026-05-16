@@ -35,3 +35,6 @@ htmlcov/
 
 # Runtime artifacts
 .cc-code/
+
+# CLAUDE.md 
+CLAUDE.md
