@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from cc_code.config import sanitize_subprocess_env
 from cc_code.tooling import ToolResult
 
 
@@ -236,7 +237,7 @@ class WorktreeIsolator:
             result = subprocess.run(
                 [command, *args],
                 cwd=str(exec_cwd),
-                env=os.environ.copy(),
+                env=sanitize_subprocess_env(),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -387,7 +388,7 @@ def execute_safely(
             result = subprocess.run(
                 [command, *args],
                 cwd=str(source_path),
-                env=os.environ.copy(),
+                env=sanitize_subprocess_env(),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

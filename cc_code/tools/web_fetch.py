@@ -17,15 +17,49 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         hostname = parsed.hostname
-        
+
         if not hostname:
             return False, "Invalid URL: no hostname"
-        
+
+        hostname_lower = hostname.lower()
+
         # 阻止本地和內网地址
-        blocked_prefixes = ["localhost", "127.", "10.", "192.168.", "172.16.", "0.0.0.0", "::1", "fe80:"]
-        if any(hostname.startswith(p) for p in blocked_prefixes):
+        blocked_prefixes = [
+            "localhost", "127.", "10.", "192.168.", "172.16.", "0.0.0.0",
+            "::1", "fe80:", "fc00:", "fd00:", "::ffff:127.", "::ffff:0:",
+        ]
+        if any(hostname_lower.startswith(p) for p in blocked_prefixes):
             return False, f"Access to internal addresses blocked: {hostname}"
-        
+
+        # 阻止云元数据端点 (AWS / GCP / Azure / DigitalOcean)
+        blocked_hosts = {
+            "169.254.169.254",                # AWS / cloud metadata
+            "metadata.google.internal",       # GCP metadata
+            "169.254.169.253",                # DigitalOcean metadata
+        }
+        if hostname_lower in blocked_hosts:
+            return False, f"Access to cloud metadata endpoint blocked: {hostname}"
+
+        # 阻止可能的 DNS rebinding 绕过（如 127.0.0.1.nip.io）
+        rebinding_suffixes = (".nip.io", ".xip.io", ".sslip.io")
+        if hostname_lower.endswith(rebinding_suffixes):
+            return False, f"Access to DNS rebinding host blocked: {hostname}"
+
+        # 阻止八进制 IP 表示绕过（如 0177.0.0.1）
+        # 如果 hostname 看起来像数字但包含前导零
+        parts = hostname_lower.split(".")
+        if len(parts) == 4 and all(p and p.isdigit() for p in parts):
+            if any(p.startswith("0") and len(p) > 1 for p in parts):
+                return False, f"Access to octal IP notation blocked: {hostname}"
+            # 额外检查：用 ipaddress 解析看是否为内网地址
+            try:
+                from ipaddress import ip_address
+                addr = ip_address(hostname)
+                if addr.is_private or addr.is_loopback or addr.is_link_local:
+                    return False, f"Access to internal IP blocked: {hostname}"
+            except ValueError:
+                pass
+
         return True, "OK"
     except Exception as e:
         return False, f"URL validation failed: {e}"

@@ -9,6 +9,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
+from cc_code.config import sanitize_subprocess_env
 from cc_code.tooling import ToolDefinition, ToolResult
 
 # 安全常量：禁止在命令参数中出现的危险字符
@@ -295,7 +296,7 @@ class StdioMcpClient:
         process_cwd = Path(self.cwd)
         if self.config.get("cwd"):
             process_cwd = (process_cwd / str(self.config["cwd"])).resolve()
-        env = os.environ.copy()
+        env = sanitize_subprocess_env()
         for key, value in dict(self.config.get("env", {}) or {}).items():
             env[str(key)] = str(value)
 

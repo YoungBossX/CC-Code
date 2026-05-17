@@ -52,3 +52,18 @@ def test_memory_command_uses_current_workspace(tmp_path) -> None:
 
     assert result is not None
     assert "Memory System Status" in result
+
+
+def test_history_command_returns_recent_entries(tmp_path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text(
+        '{"entries": ["first prompt", "second prompt"]}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cc_code.history.CC_CODE_HISTORY_PATH", history_path)
+
+    result = try_handle_local_command("/history", cwd=str(tmp_path))
+
+    assert result is not None
+    assert "1. first prompt" in result
+    assert "2. second prompt" in result

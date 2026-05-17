@@ -11,7 +11,7 @@ from cc_code.tui.state import ScreenState, TtyAppArgs
 from cc_code.cli_commands import try_handle_local_command, find_matching_slash_commands
 from cc_code.agent_loop import run_agent_turn
 from cc_code.context_manager import save_context_state
-from cc_code.history import save_history_entries
+from cc_code.history import load_history_entries, save_history_entries
 from cc_code.local_tool_shortcuts import parse_local_tool_shortcut
 from cc_code.prompt import build_system_prompt
 from cc_code.tooling import ToolContext
@@ -277,6 +277,39 @@ def _handle_input(
     if input_text == "/exit":
         return True
 
+    if input_text.startswith("/history "):
+        suffix = input_text[len("/history "):].strip()
+        if suffix.isdigit():
+            history_entries = load_history_entries()
+            selected_index = int(suffix) - 1
+            if 0 <= selected_index < len(history_entries):
+                return _handle_input(
+                    args,
+                    state,
+                    rerender,
+                    submitted_raw_input=history_entries[selected_index],
+                )
+
+    if state.history_picker_entries:
+        if input_text.isdigit():
+            choice_index = int(input_text) - 1
+            if 0 <= choice_index < len(state.history_picker_entries):
+                chosen = state.history_picker_entries[choice_index]
+                state.history_picker_entries = []
+                state.history_picker_index = 0
+                state.input = ""
+                state.cursor_offset = 0
+                state.selected_slash_index = 0
+                state.status = f"Running history #{choice_index + 1}"
+                rerender()
+                return _handle_input(args, state, rerender, submitted_raw_input=chosen)
+
+        state.history_picker_entries = []
+        state.history_picker_index = 0
+        state.status = "History picker cleared"
+        rerender()
+        return False
+
     memory_mgr = getattr(args, "memory_manager", None)
     if memory_mgr is not None:
         memory_result = memory_mgr.handle_user_memory_input(input_text)
@@ -311,6 +344,14 @@ def _handle_input(
     local_result = try_handle_local_command(input_text, tools=args.tools, cwd=args.cwd)
     if local_result is not None:
         _push_transcript_entry(state, kind="assistant", body=local_result)
+        if input_text == "/history":
+            state.history_picker_entries = load_history_entries()
+            state.history_picker_index = 0
+            if state.history_picker_entries:
+                state.status = "History picker: type a number and press Enter; Esc cancels"
+            else:
+                state.status = "No prompt history found"
+            rerender()
         return False
 
     # Tool shortcuts

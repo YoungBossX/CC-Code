@@ -8,6 +8,7 @@ import sys
 from typing import Sequence
 
 from cc_code.background_tasks import register_background_shell_task
+from cc_code.config import sanitize_subprocess_env
 from cc_code.tooling import ToolDefinition, ToolResult
 from cc_code.workspace import resolve_tool_path
 
@@ -270,7 +271,7 @@ def _run(input_data: dict, context) -> ToolResult:
         child = subprocess.Popen(  # noqa: S603
             [command, *args],
             cwd=effective_cwd,
-            env=os.environ.copy(),
+            env=sanitize_subprocess_env(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
@@ -305,7 +306,7 @@ def _run(input_data: dict, context) -> ToolResult:
             process = subprocess.Popen(
                 [command, *args],
                 cwd=effective_cwd,
-                env=os.environ.copy(),
+                env=sanitize_subprocess_env(),
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -357,7 +358,7 @@ def _run(input_data: dict, context) -> ToolResult:
         completed = subprocess.run(  # noqa: S603
             [command, *args],
             cwd=effective_cwd,
-            env=os.environ.copy(),
+            env=sanitize_subprocess_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",  # 显式指定 UTF-8

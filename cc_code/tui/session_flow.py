@@ -90,6 +90,7 @@ def build_tty_runtime_state(
             "model": runtime.get("model", "unknown") if runtime else "unknown",
         }),
         cost_tracker=CostTracker(),
+        startup_mode=True,
     )
     state.history_index = len(state.history)
 

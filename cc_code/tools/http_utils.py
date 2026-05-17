@@ -7,6 +7,42 @@ import urllib.request
 from cc_code.tooling import ToolDefinition, ToolContext, ToolResult
 
 
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """检查 URL 是否安全（非内网地址）"""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+
+        if not hostname:
+            return False, "Invalid URL: no hostname"
+
+        hostname_lower = hostname.lower()
+
+        blocked_prefixes = [
+            "localhost", "127.", "10.", "192.168.", "172.16.", "0.0.0.0",
+            "::1", "fe80:", "fc00:", "fd00:", "::ffff:127.", "::ffff:0:",
+        ]
+        if any(hostname_lower.startswith(p) for p in blocked_prefixes):
+            return False, f"Access to internal addresses blocked: {hostname}"
+
+        blocked_hosts = {
+            "169.254.169.254",
+            "metadata.google.internal",
+            "169.254.169.253",
+        }
+        if hostname_lower in blocked_hosts:
+            return False, f"Access to cloud metadata endpoint blocked: {hostname}"
+
+        rebinding_suffixes = (".nip.io", ".xip.io", ".sslip.io")
+        if hostname_lower.endswith(rebinding_suffixes):
+            return False, f"Access to DNS rebinding host blocked: {hostname}"
+
+        return True, "OK"
+    except Exception as e:
+        return False, f"URL validation failed: {e}"
+
+
 def _validate_http_request(input_data: dict) -> dict:
     """Validate input for http_request tool."""
     url = input_data.get("url", "")
@@ -31,42 +67,46 @@ def _run_http_request(input_data: dict, context: ToolContext) -> ToolResult:
     headers = input_data.get("headers", {})
     body = input_data.get("body", "")
     timeout = input_data.get("timeout", 30)
-    
+
+    # SSRF 防护
+    is_safe, reason = _is_safe_url(url)
+    if not is_safe:
+        return ToolResult(ok=False, output=f"Security Error: {reason}\nURL: {url}")
+
     # Build request
     req = urllib.request.Request(url, method=method)
     for key, value in headers.items():
         req.add_header(key, value)
-    
+
     if body and method in {"POST", "PUT", "PATCH"}:
         if isinstance(body, dict):
             body = json.dumps(body)
             req.add_header("Content-Type", "application/json")
         req.data = body.encode("utf-8")
-    
+
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             status = response.status
             response_headers = dict(response.headers)
             content = response.read().decode("utf-8")
-            
-            # Try to parse JSON
+
             try:
                 content = json.dumps(json.loads(content), indent=2, ensure_ascii=False)
                 content_type = "application/json"
             except (json.JSONDecodeError, UnicodeDecodeError):
                 content_type = response_headers.get("Content-Type", "text/plain")
-            
+
             lines = [
                 f"--- Response ---",
                 f"Status: {status}",
                 f"Headers: {json.dumps(response_headers, indent=2)}",
                 f"",
                 f"Body:",
-                content[:10000],  # Limit output
+                content[:10000],
             ]
-            
+
             return ToolResult(ok=True, output="\n".join(lines))
-    
+
     except urllib.error.HTTPError as e:
         return ToolResult(ok=False, output=f"HTTP {e.code}: {e.reason}\n{e.read().decode('utf-8', errors='replace')}")
     except urllib.error.URLError as e:

@@ -98,12 +98,50 @@ def _render_footer_cached(
 def _render_prompt_panel(state: ScreenState) -> str:
     commands = _get_visible_commands(state.input)
     prompt_body = render_input_prompt(state.input, state.cursor_offset)
+    if state.history_picker_entries:
+        total = len(state.history_picker_entries)
+        current = max(0, min(state.history_picker_index, total - 1))
+        window = 5
+        start = max(0, current - window // 2)
+        end = min(total, start + window)
+        start = max(0, end - window)
+        rows = ["📜 History picker"]
+        if start > 0:
+            rows.append(f"    ... {start} earlier entries")
+        for i in range(start, end):
+            entry = state.history_picker_entries[i]
+            prefix = ">" if i == current else " "
+            rows.append(f"  {prefix} {i + 1}. {entry}")
+        if end < total:
+            rows.append(f"    ... {total - end} later entries")
+        rows.append("    ↑↓ move  Enter load  Esc cancel")
+        prompt_body += "\n" + "\n".join(rows)
     if commands:
         prompt_body += "\n" + render_slash_menu(
             commands,
             min(state.selected_slash_index, len(commands) - 1),
         )
     return render_panel("prompt", prompt_body)
+
+
+def _render_startup_panel(args: TtyAppArgs, state: ScreenState) -> str:
+    stats = _get_session_stats(args, state)
+    header = render_banner(args.runtime, args.cwd, args.permissions.get_summary(), stats, compact=True)
+    body = "\n".join([
+        render_status_line(state.status),
+        "",
+        "Welcome to CC-Code. Press Enter to open the full TUI.",
+        "",
+        "What you can do once inside:",
+        "  - Type naturally to chat with the agent",
+        "  - Use /help for commands",
+        "  - Use /history to reopen recent prompts",
+    ])
+    return "\n\n".join([
+        header,
+        render_panel("welcome", body),
+        f"{SUBTLE}Press Enter to continue{RESET}",
+    ])
 
 
 def _compute_render_hash(args: TtyAppArgs, state: ScreenState) -> int:
@@ -113,6 +151,8 @@ def _compute_render_hash(args: TtyAppArgs, state: ScreenState) -> int:
     input_hash = hash(state.input)
     cursor = state.cursor_offset
     status = hash(state.status)
+    startup = state.startup_mode
+    history_picker = hash((tuple(state.history_picker_entries[-10:]), state.history_picker_index))
     approval = 0
     if state.pending_approval:
         approval = hash((
@@ -133,6 +173,8 @@ def _compute_render_hash(args: TtyAppArgs, state: ScreenState) -> int:
         input_hash,
         cursor,
         status,
+        startup,
+        history_picker,
         state.active_tool,
         recent_tool_state,
         approval,
@@ -166,10 +208,18 @@ def _render_screen(args: TtyAppArgs, state: ScreenState) -> None:
     # 获取上下文帮助
     contextual_help = _get_contextual_help(state, args)
 
+    if state.startup_mode:
+        output = "\u001b[2J\u001b[H" + _render_startup_panel(args, state)
+        sys.stdout.write(output)
+        sys.stdout.flush()
+        _last_render_hash = current_hash
+        _last_render_time = now
+        return
+
     # Build the entire frame into a buffer, then write once
     buf: list[str] = []
     # CSI H + CSI J  (cursor home + erase to end) – avoids full clear flicker
-    buf.append("\u001b[H\u001b[J")
+    buf.append("\u001b[2J\u001b[H")
 
     # Header
     buf.append(_render_header_panel(args, state))

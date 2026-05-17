@@ -15,6 +15,7 @@ from cc_code.tui.runtime_control import _ThrottledRenderer as RuntimeThrottledRe
 from cc_code.tui.event_flow import _handle_event
 from cc_code.tui.input_parser import KeyEvent
 from cc_code.tui.state import ScreenState, TtyAppArgs
+from cc_code.tui.renderer import _render_prompt_panel, _render_startup_panel
 from cc_code.tui.transcript import format_transcript_text
 from cc_code.tui.types import TranscriptEntry
 
@@ -150,6 +151,150 @@ def test_empty_tty_return_does_not_start_input_handler(tmp_path) -> None:
 
     assert "handle_input" not in calls
     assert state.input == ""
+
+
+def test_tty_return_submits_exact_history_command(tmp_path) -> None:
+    submitted: list[str] = []
+    state = ScreenState(input="/history", cursor_offset=8, selected_slash_index=0)
+    args = TtyAppArgs(
+        runtime=None,
+        tools=ToolRegistry([]),
+        model=object(),
+        messages=[],
+        cwd=str(tmp_path),
+        permissions=PermissionManager(str(tmp_path)),
+    )
+
+    def handle_input(*callback_args, **_kwargs):
+        submitted.append(callback_args[3])
+        return False
+
+    _handle_event(
+        args,
+        state,
+        KeyEvent(name="return", ctrl=False, meta=False),
+        lambda: None,
+        __import__("threading").Event(),
+        {},
+        handle_input,
+    )
+
+    assert submitted == ["/history"]
+    assert state.input == ""
+
+
+def test_tty_enter_leaves_startup_mode(tmp_path) -> None:
+    state = ScreenState(startup_mode=True)
+    args = TtyAppArgs(
+        runtime={"model": "demo"},
+        tools=ToolRegistry([]),
+        model=object(),
+        messages=[],
+        cwd=str(tmp_path),
+        permissions=PermissionManager(str(tmp_path)),
+    )
+
+    _handle_event(
+        args,
+        state,
+        KeyEvent(name="return", ctrl=False, meta=False),
+        lambda: None,
+        __import__("threading").Event(),
+        {},
+        lambda *_args, **_kwargs: False,
+    )
+
+    assert state.startup_mode is False
+
+
+def test_startup_panel_shows_enter_message(tmp_path) -> None:
+    state = ScreenState(startup_mode=True)
+    args = TtyAppArgs(
+        runtime={"model": "demo"},
+        tools=ToolRegistry([]),
+        model=object(),
+        messages=[],
+        cwd=str(tmp_path),
+        permissions=PermissionManager(str(tmp_path)),
+    )
+
+    rendered = _render_startup_panel(args, state)
+
+    assert "Press Enter to continue" in rendered
+    assert "Welcome back" in rendered
+
+
+def test_tty_history_picker_number_executes_selected_entry(tmp_path, monkeypatch) -> None:
+    state = ScreenState(
+        input="1",
+        cursor_offset=1,
+        history_picker_entries=["/help", "/config"],
+        history_picker_index=0,
+    )
+    args = TtyAppArgs(
+        runtime=None,
+        tools=ToolRegistry([]),
+        model=object(),
+        messages=[],
+        cwd=str(tmp_path),
+        permissions=PermissionManager(str(tmp_path)),
+    )
+
+    def fake_try_handle_local_command(user_input: str, tools=None, cwd: str | None = None):
+        if user_input == "/help":
+            return "history item handled"
+        return None
+
+    monkeypatch.setattr(input_handler_module, "try_handle_local_command", fake_try_handle_local_command)
+
+    assert input_handler_module._handle_input(args, state, lambda: None) is False
+
+    assert state.history_picker_entries == []
+    assert state.transcript[-1].body == "history item handled"
+    assert state.history[-1] == "/help"
+
+
+def test_tty_history_direct_number_executes_selected_entry(tmp_path, monkeypatch) -> None:
+    state = ScreenState(input="/history 1", cursor_offset=10)
+    args = TtyAppArgs(
+        runtime=None,
+        tools=ToolRegistry([]),
+        model=object(),
+        messages=[],
+        cwd=str(tmp_path),
+        permissions=PermissionManager(str(tmp_path)),
+    )
+
+    monkeypatch.setattr(input_handler_module, "load_history_entries", lambda: ["/help", "/config"])
+    executed: list[str] = []
+
+    def fake_try_handle_local_command(user_input: str, tools=None, cwd: str | None = None):
+        executed.append(user_input)
+        if user_input == "/help":
+            return "direct history handled"
+        return None
+
+    monkeypatch.setattr(input_handler_module, "try_handle_local_command", fake_try_handle_local_command)
+
+    assert input_handler_module._handle_input(args, state, lambda: None) is False
+
+    assert executed == ["/help"]
+    assert state.transcript[-1].body == "direct history handled"
+
+
+def test_history_picker_render_keeps_current_entry_visible() -> None:
+    state = ScreenState(
+        input="",
+        cursor_offset=0,
+        history_picker_entries=[f"/cmd {i}" for i in range(1, 11)],
+        history_picker_index=8,
+    )
+
+    rendered = _render_prompt_panel(state)
+
+    assert "9. /cmd 9" in rendered
+    assert "> 9. /cmd 9" in rendered
+    assert "..." in rendered
 
 
 def test_tty_input_passes_and_persists_context_manager(tmp_path, monkeypatch) -> None:

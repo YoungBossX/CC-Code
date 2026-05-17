@@ -210,6 +210,14 @@ def _handle_normal_mode_key(
     rerender: Callable[[], None],
     handle_input_fn: Callable[[TtyAppArgs, ScreenState, Callable[[], None], str | None], bool],
 ) -> bool:
+    if state.startup_mode:
+        if event.name == "return":
+            state.startup_mode = False
+            state.status = "Ready"
+            rerender()
+            return True
+        return True
+
     if event.name == "return":
         _handle_normal_mode_return(args, state, visible_commands, rerender, handle_input_fn)
         return True
@@ -247,9 +255,33 @@ def _handle_normal_mode_return(
     rerender: Callable[[], None],
     handle_input_fn: Callable[[TtyAppArgs, ScreenState, Callable[[], None], str | None], bool],
 ) -> None:
+    if state.history_picker_entries:
+        if 0 <= state.history_picker_index < len(state.history_picker_entries):
+            submitted = state.history_picker_entries[state.history_picker_index]
+            state.history_picker_entries = []
+            state.history_picker_index = 0
+            state.input = ""
+            state.cursor_offset = 0
+            state.selected_slash_index = 0
+            rerender()
+            if submitted.strip() and handle_input_fn(args, state, rerender, submitted):
+                raise SystemExit(0)
+            rerender()
+        return
+
     if visible_commands and 0 <= state.selected_slash_index < len(visible_commands):
         selected = visible_commands[state.selected_slash_index]
         usage = getattr(selected, "usage", str(selected))
+        if state.input.strip() == usage.strip():
+            submitted = state.input
+            state.input = ""
+            state.cursor_offset = 0
+            state.selected_slash_index = 0
+            rerender()
+            if submitted.strip() and handle_input_fn(args, state, rerender, submitted):
+                raise SystemExit(0)
+            rerender()
+            return
         state.input = usage
         state.cursor_offset = len(state.input)
         state.selected_slash_index = 0
@@ -286,6 +318,17 @@ def _handle_normal_mode_navigation(
     event: KeyEvent,
     rerender: Callable[[], None],
 ) -> bool:
+    if state.history_picker_entries:
+        if event.name == "up":
+            state.history_picker_index = (state.history_picker_index - 1 + len(state.history_picker_entries)) % len(state.history_picker_entries)
+            rerender()
+            return True
+
+        if event.name == "down":
+            state.history_picker_index = (state.history_picker_index + 1) % len(state.history_picker_entries)
+            rerender()
+            return True
+
     if event.name == "backspace" and state.cursor_offset > 0:
         state.input = state.input[: state.cursor_offset - 1] + state.input[state.cursor_offset :]
         state.cursor_offset -= 1
@@ -320,6 +363,11 @@ def _handle_normal_mode_navigation(
         return True
 
     if event.name == "escape":
+        if state.history_picker_entries:
+            state.history_picker_entries = []
+            state.status = None
+            rerender()
+            return True
         state.input = ""
         state.cursor_offset = 0
         state.selected_slash_index = 0

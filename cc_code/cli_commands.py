@@ -10,6 +10,7 @@ from cc_code.config import (
     load_runtime_config,
     save_cc_code_settings,
 )
+from cc_code.history import load_history_entries
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +118,16 @@ def format_slash_commands() -> str:
     return "\n".join(lines)
 
 
+def _format_history(entries: list[str], limit: int = 20) -> str:
+    if not entries:
+        return "No prompt history found."
+    start = max(0, len(entries) - limit)
+    recent = entries[start:]
+    return "\n".join(
+        f"{start + i + 1}. {entry}" for i, entry in enumerate(recent)
+    )
+
+
 def find_matching_slash_commands(user_input: str) -> list[str]:
     return [command.usage for command in SLASH_COMMANDS if command.usage.startswith(user_input)]
 
@@ -155,6 +166,10 @@ def try_handle_local_command(user_input: str, tools=None, cwd: str | None = None
     if user_input == "/config":
         from cc_code.config import format_config_diagnostic
         return format_config_diagnostic()
+
+    if user_input == "/history":
+        entries = load_history_entries()
+        return _format_history(entries)
 
     if user_input == "/state":
         try:

@@ -7,6 +7,9 @@ from cc_code.tui.state import ScreenState, TtyAppArgs
 
 def _get_contextual_help(state: ScreenState, args: TtyAppArgs) -> str | None:
     """Return a small context-sensitive hint for the footer area."""
+    if state.history_picker_entries:
+        return "📜 History picker: type a number and press Enter to load it; Esc cancels"
+
     if not state.is_busy and not state.pending_approval:
         tips = [
             "💡 Tip: Use /skills to see available workflows",

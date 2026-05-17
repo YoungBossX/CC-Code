@@ -16,6 +16,20 @@ CC_CODE_MCP_PATH = CC_CODE_DIR / "mcp.json"
 CC_CODE_USER_PROFILE_PATH = CC_CODE_DIR / "USER.md"
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
+# 凭证类环境变量 — 不应传递给子进程
+_CREDENTIAL_ENV_VARS: set[str] = {
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CUSTOM_API_KEY",
+}
+
+
+def sanitize_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """返回去除凭证变量后的环境变量副本，用于子进程。"""
+    env = (env if env is not None else os.environ).copy()
+    for key in _CREDENTIAL_ENV_VARS:
+        env.pop(key, None)
+    return env
+
 
 def project_user_profile_path(cwd: str | Path | None = None) -> Path:
     """Return the project-level USER.md path."""

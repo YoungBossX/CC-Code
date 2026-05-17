@@ -53,11 +53,14 @@ class ScreenState:
     transcript: list[TranscriptEntry] = field(default_factory=list)
     transcript_scroll_offset: int = 0
     transcript_revision: int = 0
+    startup_mode: bool = False
     selected_slash_index: int = 0
     status: str | None = None
     active_tool: str | None = None
     recent_tools: list[dict[str, str]] = field(default_factory=list)
     history: list[str] = field(default_factory=list)
+    history_picker_entries: list[str] = field(default_factory=list)
+    history_picker_index: int = 0
     history_index: int = 0
     history_draft: str = ""
     next_entry_id: int = 1

@@ -477,6 +477,6 @@ def format_model_status(model: str, runtime: dict | None = None) -> str:
         f"  Pricing:  ${info.pricing_input:.2f} / ${info.pricing_output:.2f} (in/out per 1M)",
         f"  Tools:    {'Yes' if info.supports_tools else 'No'}",
         f"  Vision:   {'Yes' if info.supports_vision else 'No'}",
-        f"  API Key:  {'*' * 8}{pconfig.api_key[-4:]}" if len(pconfig.api_key) > 4 else "  API Key:  not set",
+        f"  API Key:  [configured]" if pconfig.api_key else "  API Key:  not set",
     ]
     return "\n".join(lines)
