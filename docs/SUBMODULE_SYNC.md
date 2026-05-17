@@ -105,7 +105,7 @@ It is usually a submodule pointer issue.
 
 When updating the Python version from the main repository:
 
-1. confirm the target commit exists in `QUSETIONS/CC-Coder-Python`
+1. confirm the target commit exists in `YoungBossX/CC-Code`
 2. update the submodule pointer in the main `CC-Coder` repository
 3. commit the pointer update
 4. verify the main repo now resolves to the expected Python commit

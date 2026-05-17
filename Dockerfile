@@ -37,7 +37,7 @@ FROM python:3.12-slim AS runtime
 
 LABEL org.opencontainers.image.title="CC-Coder"
 LABEL org.opencontainers.image.description="CC-Coder is a lightweight terminal coding assistant"
-LABEL org.opencontainers.image.source="https://github.com/QUSETIONS/CC-Coder"
+LABEL org.opencontainers.image.source="https://github.com/YoungBossX/CC-Code"
 
 # Create non-root user for security
 RUN groupadd --gid 1000 cc-coder && \

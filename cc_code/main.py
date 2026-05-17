@@ -194,7 +194,7 @@ def main() -> None:
             "  3. Or edit ~/.cc-code/settings.json:\n"
             '     {"model": "claude-sonnet-4-20250514", "env": {"ANTHROPIC_API_KEY": "sk-ant-..."}}\n'
             "  4. Restart CC-Coder\n\n"
-            "📖 For more info: https://github.com/QUSETIONS/CC-Coder-Python\n"
+            "📖 For more info: https://github.com/YoungBossX/CC-Code\n"
             "   Falling back to mock model for now...\n",
             file=sys.stderr,
         )
