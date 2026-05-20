@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -9,6 +8,7 @@ from typing import Sequence
 
 from cc_code.background_tasks import register_background_shell_task
 from cc_code.config import sanitize_subprocess_env
+from cc_code.permissions import classify_command_risk
 from cc_code.tooling import ToolDefinition, ToolResult
 from cc_code.workspace import resolve_tool_path
 
@@ -129,26 +129,6 @@ def _strip_trailing_background_operator(command: str) -> str:
     return command.strip().removesuffix("&").strip()
 
 
-def _classify_shell_snippet_risk(command: str) -> str | None:
-    lowered = command.lower()
-    collapsed = re.sub(r"\s+", " ", lowered).strip()
-    if re.search(r"\brm\s+-[a-z]*r[a-z]*f\b|\brm\s+-[a-z]*f[a-z]*r\b", collapsed):
-        return f"shell snippet contains rm -rf payload: {command}"
-    if re.search(r"\b(del|erase)\b.*\s/(s|q)\b", collapsed):
-        return f"shell snippet contains recursive Windows delete payload: {command}"
-    if re.search(r"\b(rmdir|rd)\b.*\s/s\b", collapsed):
-        return f"shell snippet contains recursive Windows directory removal: {command}"
-    if re.search(r"\b(curl|wget)\b.*\|\s*(sh|bash|zsh|fish)\b", collapsed):
-        return f"shell snippet downloads and executes a shell script: {command}"
-    if re.search(r"\b(iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b.*\|\s*(iex|invoke-expression)\b", collapsed):
-        return f"shell snippet downloads and executes PowerShell code: {command}"
-    if re.search(r"\b(powershell|pwsh)\b.*\b(iex|invoke-expression)\b", collapsed):
-        return f"shell snippet invokes PowerShell expression execution: {command}"
-    if re.search(r"\b(sh|bash|zsh|fish|cmd|powershell|pwsh)\b\s+(-c|/c|/command)\b", collapsed):
-        return f"shell snippet invokes an explicit command interpreter: {command}"
-    return None
-
-
 def _normalize_command_input(input_data: dict) -> tuple[str, list[str]]:
     command = str(input_data.get("command", "")).strip()
     raw_args = input_data.get("args") or []
@@ -233,30 +213,51 @@ def _run(input_data: dict, context) -> ToolResult:
     if not normalized_command:
         return ToolResult(ok=False, output="Command not allowed: empty command")
 
+    raw_command_string = input_data["command"]
     raw_args = input_data.get("args") or []
-    use_shell = _looks_like_shell_snippet(input_data["command"], raw_args)
-    background_shell = _is_background_shell_snippet(input_data["command"], raw_args)
-    known_command = _is_allowed_command(normalized_command)
+    use_shell = _looks_like_shell_snippet(raw_command_string, raw_args)
+    background_shell = _is_background_shell_snippet(raw_command_string, raw_args)
+
+    # Classify on the ORIGINAL command string + structured argv, BEFORE any
+    # shell wrapping. This way `cmd /c "del /s /q *"` is classified by what
+    # the model wrote ("del /s /q *"), not by the wrapper "cmd".
+    full_command_for_classification = raw_command_string if use_shell else " ".join(
+        [normalized_command, *normalized_args]
+    )
+    risk_reason = classify_command_risk(
+        full_command_for_classification,
+        [normalized_command, *normalized_args],
+    )
 
     command, args = _build_execution_command(
-        input_data["command"],
+        raw_command_string,
         normalized_command,
         normalized_args,
         use_shell=use_shell,
         background_shell=background_shell,
     )
-    shell_prompt_reason = _classify_shell_snippet_risk(input_data["command"]) if use_shell else None
-    force_prompt_reason = (
-        shell_prompt_reason
-        if shell_prompt_reason
-        else None if use_shell or known_command else f"Unknown command '{normalized_command}' is not in the built-in read-only/development set"
-    )
 
     if context.permissions is not None:
-        if force_prompt_reason:
-            context.permissions.ensure_command(command, args, effective_cwd, force_prompt_reason=force_prompt_reason)
-        elif use_shell or not _is_read_only_command(normalized_command):
-            context.permissions.ensure_command(command, args, effective_cwd)
+        if risk_reason:
+            context.permissions.ensure_command(
+                command, args, effective_cwd, force_prompt_reason=risk_reason,
+            )
+        elif use_shell:
+            # Shell snippets are always behind a prompt: an unrestricted shell
+            # can do anything (sandbox would be the real fix; we don't have one).
+            context.permissions.ensure_command(
+                command, args, effective_cwd,
+                force_prompt_reason=f"Shell snippet: {raw_command_string.strip()[:200]}",
+            )
+        elif _is_read_only_command(normalized_command):
+            pass  # known read-only entry-point → no prompt
+        elif _is_allowed_command(normalized_command):
+            pass  # known dev entry-point; dangerous variants caught above
+        else:
+            context.permissions.ensure_command(
+                command, args, effective_cwd,
+                force_prompt_reason=f"Unknown command '{normalized_command}' is not in the built-in allowlist",
+            )
 
     if use_shell and background_shell:
         # Platform-specific process isolation flags
@@ -384,7 +385,15 @@ def _run(input_data: dict, context) -> ToolResult:
 
 run_command_tool = ToolDefinition(
     name="run_command",
-    description="Run a common development command from an allowlist. Supports optional timeout parameter (1-600 seconds).",
+    description=(
+        "Run a shell command. Uses cmd on Windows and $SHELL on Unix when the command "
+        "contains pipes/redirects/glob expansion (|, ;, &, $, <, >, (, ), `), otherwise "
+        "invokes the binary directly. Prefer simple forms — avoid shell metacharacters "
+        "when not needed, since shell snippets always require permission approval. "
+        "Destructive patterns (rm -rf, del /s/q, curl|sh, git reset --hard, etc.) are "
+        "detected on the FULL command string and prompt regardless of how they're invoked. "
+        "Optional timeout (1-600s, default 300)."
+    ),
     input_schema={"type": "object", "properties": {"command": {"type": "string", "description": "Command to run"}, "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments"}, "cwd": {"type": "string", "description": "Working directory"}, "timeout": {"type": "integer", "description": "Timeout in seconds (1-600, default 300)"}}, "required": ["command"]},
     validator=_validate,
     run=_run,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
+from cc_code.io_atomic import atomic_write_text
 from cc_code.tooling import ToolContext, ToolResult
 
 
@@ -44,6 +45,5 @@ def apply_reviewed_file_change(
     if context.permissions is not None:
         context.permissions.ensure_edit(str(target), diff)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(next_content, encoding="utf-8")
+    atomic_write_text(target, next_content)
     return ToolResult(ok=True, output=f"Applied reviewed changes to {file_path}")

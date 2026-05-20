@@ -61,9 +61,9 @@ def test_save_and_load_session(temp_session_dir):
     ]
     
     save_session(session)
-    
+
     # Verify file was created
-    session_file = temp_session_dir / f"{session.session_id}.json"
+    session_file = temp_session_dir / f"{session.session_id}.jsonl"
     assert session_file.exists()
     
     # Load and verify
@@ -91,7 +91,7 @@ def test_delete_session(temp_session_dir):
     assert result is True
     
     # Verify file is gone
-    session_file = temp_session_dir / f"{session.session_id}.json"
+    session_file = temp_session_dir / f"{session.session_id}.jsonl"
     assert not session_file.exists()
     
     # Try deleting again

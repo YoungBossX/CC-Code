@@ -1,8 +1,8 @@
-from dataclasses import dataclass, field, asdict
-from typing import Any
-from enum import Enum
-import time
 import json
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 
@@ -81,55 +81,75 @@ class AgentMetricsCollector:
         self._turns: list[AgentTurnMetrics] = []
         self._tool_stats: dict[str, ToolHistoricalStats] = {}
         self._current_turn: AgentTurnMetrics | None = None
+        # Legacy single-in-flight slot, used by the no-handle start_tool/end_tool
+        # API (kept for existing tests). Concurrent agent_loop workers use the
+        # handle-based begin_tool/finish_tool instead.
         self._current_tool: ToolExecutionRecord | None = None
         self._storage_path = storage_path
+        # Protects _current_turn.tool_records (worker threads append) and
+        # _tool_stats / _turns (read on end_turn, write on _save).
+        self._lock = threading.Lock()
         if storage_path and storage_path.exists():
             self._load()
-    
+
     def start_turn(self, turn_id: int) -> None:
         """Start recording a new agent turn."""
         self._current_turn = AgentTurnMetrics(turn_id=turn_id, start_time=time.time())
-    
+
     def end_turn(self, total_tokens: int = 0) -> AgentTurnMetrics:
         """End the current turn and return metrics."""
         if self._current_turn is None:
             raise RuntimeError("No turn in progress")
         self._current_turn.end_time = time.time()
         self._current_turn.total_tokens = total_tokens
-        self._turns.append(self._current_turn)
-        
-        # Update historical stats
-        for record in self._current_turn.tool_records:
-            self._update_tool_stats(record)
-        
-        result = self._current_turn
-        self._current_turn = None
+
+        with self._lock:
+            self._turns.append(self._current_turn)
+            for record in self._current_turn.tool_records:
+                self._update_tool_stats(record)
+            result = self._current_turn
+            self._current_turn = None
         self._save()
         return result
-    
+
+    def begin_tool(self, tool_name: str) -> ToolExecutionRecord:
+        """Begin recording a tool execution and return a handle.
+
+        Thread-safe. Use this from concurrent worker threads, paired with
+        finish_tool(record, ...). Multiple in-flight records do not clobber
+        each other (unlike the legacy start_tool/end_tool API).
+        """
+        return ToolExecutionRecord(tool_name=tool_name, start_time=time.time())
+
+    def finish_tool(
+        self,
+        record: ToolExecutionRecord,
+        success: bool,
+        error: str = "",
+        tokens: int = 0,
+    ) -> ToolExecutionRecord:
+        """Finish a tool execution by handle. Thread-safe."""
+        record.end_time = time.time()
+        record.success = success
+        record.error_message = error
+        record.tokens_consumed = tokens
+        record.error_category = self._classify_error(error)
+        with self._lock:
+            if self._current_turn:
+                self._current_turn.tool_records.append(record)
+        return record
+
     def start_tool(self, tool_name: str) -> None:
-        """Start recording a tool execution."""
-        self._current_tool = ToolExecutionRecord(
-            tool_name=tool_name,
-            start_time=time.time(),
-        )
-    
+        """Legacy single-in-flight tool start. Not safe for concurrent use."""
+        self._current_tool = self.begin_tool(tool_name)
+
     def end_tool(self, success: bool, error: str = "", tokens: int = 0) -> ToolExecutionRecord:
-        """End the current tool execution."""
+        """Legacy single-in-flight tool end. Not safe for concurrent use."""
         if self._current_tool is None:
             raise RuntimeError("No tool execution in progress")
-        self._current_tool.end_time = time.time()
-        self._current_tool.success = success
-        self._current_tool.error_message = error
-        self._current_tool.tokens_consumed = tokens
-        self._current_tool.error_category = self._classify_error(error)
-        
-        if self._current_turn:
-            self._current_turn.tool_records.append(self._current_tool)
-        
-        result = self._current_tool
+        record = self._current_tool
         self._current_tool = None
-        return result
+        return self.finish_tool(record, success=success, error=error, tokens=tokens)
     
     def get_tool_stats(self, tool_name: str) -> ToolHistoricalStats:
         """Get historical stats for a tool."""

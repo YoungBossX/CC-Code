@@ -8,8 +8,9 @@ Provides a simple, predictable state container with:
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Generic, TypeVar
 
 T = TypeVar("T")
@@ -41,54 +42,63 @@ class Store(Generic[T]):
         self._listeners: list[Callable[[], None]] = []
         self._on_change = on_change
         self._update_count = 0
-    
+        self._lock = threading.Lock()
+
     def get_state(self) -> T:
         """Get current state."""
         return self._state
-    
+
     def set_state(self, updater: Callable[[T], T]) -> None:
         """Update state using an updater function.
-        
+
+        The updater MUST return a new state object (e.g. via
+        dataclasses.replace) — in-place mutation defeats the `is prev`
+        change detection below and silently skips all subscribers.
+
         Args:
             updater: Function that takes current state and returns new state
         """
-        prev = self._state
-        next_state = updater(prev)
-        
-        # Skip no-op updates
-        if next_state is prev:
-            return
-        
-        # Invoke change callback
-        if self._on_change:
-            self._on_change(next_state, prev)
-        
-        self._state = next_state
-        self._update_count += 1
-        
-        # Notify subscribers
-        for listener in self._listeners:
+        with self._lock:
+            prev = self._state
+            next_state = updater(prev)
+
+            if next_state is prev:
+                return
+
+            self._state = next_state
+            self._update_count += 1
+            listeners_snapshot = list(self._listeners)
+            on_change = self._on_change
+
+        if on_change:
+            try:
+                on_change(next_state, prev)
+            except Exception:
+                pass
+
+        for listener in listeners_snapshot:
             try:
                 listener()
             except Exception:
-                # Don't let listener errors break state updates
                 pass
     
     def subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
         """Subscribe to state changes.
-        
+
         Args:
             listener: Callback invoked on state changes
-        
+
         Returns:
             Unsubscribe function
         """
-        self._listeners.append(listener)
-        
+        with self._lock:
+            self._listeners.append(listener)
+
         def unsubscribe():
-            if listener in self._listeners:
-                self._listeners.remove(listener)
-        
+            with self._lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
         return unsubscribe
     
     @property
@@ -227,21 +237,23 @@ def format_app_state_summary(state: AppState) -> str:
 # State updaters (helper functions)
 # ---------------------------------------------------------------------------
 
+# Updaters return a NEW AppState (via dataclasses.replace) so that
+# Store.set_state can detect the change via `next_state is prev` and
+# fire subscribers. In-place mutation breaks that contract.
+
 def update_message_count(count: int) -> Callable[[AppState], AppState]:
-    """Create an updater that sets message count."""
     def updater(state: AppState) -> AppState:
-        state.message_count = count
-        state.update_timestamp()
-        return state
+        return replace(state, message_count=count, last_updated=time.time())
     return updater
 
 
 def increment_tool_calls() -> Callable[[AppState], AppState]:
-    """Create an updater that increments tool call count."""
     def updater(state: AppState) -> AppState:
-        state.tool_call_count += 1
-        state.update_timestamp()
-        return state
+        return replace(
+            state,
+            tool_call_count=state.tool_call_count + 1,
+            last_updated=time.time(),
+        )
     return updater
 
 
@@ -249,59 +261,62 @@ def update_context_usage(
     tokens: int,
     window_size: int | None = None,
 ) -> Callable[[AppState], AppState]:
-    """Create an updater that updates context usage."""
     def updater(state: AppState) -> AppState:
-        state.token_usage = tokens
-        if window_size is not None:
-            state.context_window_size = window_size
-        if state.context_window_size > 0:
-            state.context_usage_percentage = (
-                tokens / state.context_window_size * 100
-            )
-        state.update_timestamp()
-        return state
+        next_window = window_size if window_size is not None else state.context_window_size
+        percentage = (tokens / next_window * 100) if next_window > 0 else 0.0
+        return replace(
+            state,
+            token_usage=tokens,
+            context_window_size=next_window,
+            context_usage_percentage=percentage,
+            last_updated=time.time(),
+        )
     return updater
 
 
 def add_cost(cost_usd: float) -> Callable[[AppState], AppState]:
-    """Create an updater that adds cost."""
     def updater(state: AppState) -> AppState:
-        state.total_cost_usd += cost_usd
-        state.api_calls += 1
-        state.update_timestamp()
-        return state
+        return replace(
+            state,
+            total_cost_usd=state.total_cost_usd + cost_usd,
+            api_calls=state.api_calls + 1,
+            last_updated=time.time(),
+        )
     return updater
 
 
 def record_api_error() -> Callable[[AppState], AppState]:
-    """Create an updater that records an API error."""
     def updater(state: AppState) -> AppState:
-        state.api_errors += 1
-        state.api_calls += 1
-        state.update_timestamp()
-        return state
+        return replace(
+            state,
+            api_errors=state.api_errors + 1,
+            api_calls=state.api_calls + 1,
+            last_updated=time.time(),
+        )
     return updater
 
 
 def set_busy(tool_name: str | None = None) -> Callable[[AppState], AppState]:
-    """Create an updater that sets busy state."""
     def updater(state: AppState) -> AppState:
-        state.is_busy = True
-        state.active_tool = tool_name
-        state.status_message = f"Running {tool_name}..." if tool_name else "Working..."
-        state.update_timestamp()
-        return state
+        return replace(
+            state,
+            is_busy=True,
+            active_tool=tool_name,
+            status_message=f"Running {tool_name}..." if tool_name else "Working...",
+            last_updated=time.time(),
+        )
     return updater
 
 
 def set_idle() -> Callable[[AppState], AppState]:
-    """Create an updater that sets idle state."""
     def updater(state: AppState) -> AppState:
-        state.is_busy = False
-        state.active_tool = None
-        state.status_message = "Ready"
-        state.update_timestamp()
-        return state
+        return replace(
+            state,
+            is_busy=False,
+            active_tool=None,
+            status_message="Ready",
+            last_updated=time.time(),
+        )
     return updater
 
 

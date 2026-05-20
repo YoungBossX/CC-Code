@@ -7,7 +7,7 @@ from typing import Any, Callable
 from cc_code.context_manager import ContextManager, estimate_message_tokens
 from cc_code.logging_config import get_logger
 from cc_code.permissions import PermissionManager
-from cc_code.state import Store, AppState, increment_tool_calls, add_cost, record_api_error, update_context_usage, set_busy, set_idle
+from cc_code.state import Store, AppState, increment_tool_calls, set_busy, set_idle
 from cc_code.tooling import ToolContext, ToolRegistry, ToolResult
 from cc_code.types import AgentStep, ChatMessage, ModelAdapter
 
@@ -16,7 +16,7 @@ from cc_code.hooks import HookEvent, fire_hook_sync
 
 # Intelligence integration
 from cc_code.agent_metrics import AgentMetricsCollector
-from cc_code.agent_intelligence import ErrorClassifier, NudgeGenerator, RecoveryStrategy, ToolScheduler
+from cc_code.agent_intelligence import ErrorClassifier, NudgeGenerator, ToolScheduler
 
 logger = get_logger("agent_loop")
 
@@ -68,68 +68,104 @@ def _execute_single_tool(
     runtime: dict | None,
     store: Any | None,
     step: int,
-    on_tool_start: Callable[[str, dict], None] | None,
-    on_tool_result: Callable[[str, str, bool], None] | None,
+    *,
+    metrics_collector: AgentMetricsCollector | None = None,
+    fire_ui_callbacks: bool = True,
+    on_tool_start: Callable[[str, dict], None] | None = None,
+    on_tool_result: Callable[[str, str, bool], None] | None = None,
 ) -> ToolResult:
-    """Execute a single tool call with hooks, state updates, and crash protection.
-    
-    Used both for serial execution and as a worker function for concurrent execution.
-    When running concurrently (store/on_tool_start/on_tool_result are None),
-    hooks and UI callbacks are deferred to the result processing phase.
-    
-    Includes a global exception safety net: any unexpected crash in the tool
-    execution pipeline (hooks, state updates, etc.) is caught and converted
-    to an error ToolResult, preventing the entire agent loop from crashing.
+    """Execute one tool call with the full lifecycle: pre-hook → metrics start
+    → store-busy → execute → store-idle → metrics end → post-hook.
+
+    Used uniformly by the serial and concurrent paths in run_agent_turn. The
+    pre/post hooks, metrics, and store updates are thread-safe (Store has its
+    own lock; AgentMetricsCollector.begin_tool/finish_tool are handle-based).
+
+    UI callbacks (on_tool_start / on_tool_result) update transcript state that
+    is NOT thread-safe — pass `fire_ui_callbacks=False` from worker threads
+    and let the caller fire them on the agent thread once results arrive.
+
+    Any unexpected crash in this pipeline is caught and converted to an error
+    ToolResult so a single bad tool can't kill the whole turn.
     """
     tool_name = call["toolName"]
     tool_input = call["input"]
-    
+    metrics_record = None
+
     try:
-        # Pre-tool hooks and UI (only for serial execution)
-        if on_tool_start:
+        # Pre-tool hook (fires before any side effects; semantically a hook
+        # that wants to deny could raise to abort — surfaces as error result).
+        fire_hook_sync(
+            HookEvent.PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            step=step,
+        )
+
+        if fire_ui_callbacks and on_tool_start:
             on_tool_start(tool_name, tool_input)
-        
+
         if store:
             store.set_state(set_busy(tool_name))
-        
+
+        if metrics_collector:
+            metrics_record = metrics_collector.begin_tool(tool_name)
+
         # Execute the tool (ToolRegistry.execute already has its own safety net)
         result = tools.execute(
             tool_name,
             tool_input,
             ToolContext(cwd=cwd, permissions=permissions, _runtime=runtime),
         )
-        
-        # Post-tool state updates (only for serial execution)
+
+        if metrics_collector and metrics_record is not None:
+            metrics_collector.finish_tool(
+                metrics_record,
+                success=result.ok,
+                error="" if result.ok else result.output,
+            )
+
         if store:
             store.set_state(increment_tool_calls())
             store.set_state(set_idle())
-        
-        if on_tool_result:
+
+        # Post-tool hook always fires after execution.
+        fire_hook_sync(
+            HookEvent.POST_TOOL_USE,
+            tool_name=tool_name,
+            tool_output=result.output,
+            is_error=not result.ok,
+            step=step,
+        )
+
+        if fire_ui_callbacks and on_tool_result:
             on_tool_result(tool_name, result.output, not result.ok)
-        
+
         return result
-    
+
     except (KeyboardInterrupt, SystemExit):
-        # Always propagate these
         raise
     except Exception as exc:  # noqa: BLE001
-        # Global safety net: catch ANY unexpected error in the tool execution
-        # pipeline (hooks, state updates, permission checks, etc.) and convert
-        # it to an error result. This prevents a single tool crash from
-        # cascading into a full session failure.
         import traceback
         tb_excerpt = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)[-3:]).strip()
         error_type = type(exc).__name__
-        
         logger.error("Tool execution pipeline crashed (%s): %s", error_type, exc)
-        
-        # Ensure state is reset even on crash
+
+        # Finalize metrics even on crash, so success rates stay accurate.
+        if metrics_collector and metrics_record is not None:
+            try:
+                metrics_collector.finish_tool(
+                    metrics_record, success=False, error=f"{error_type}: {exc}"
+                )
+            except Exception:
+                pass
+
         if store:
             try:
                 store.set_state(set_idle())
             except Exception:
                 pass
-        
+
         return ToolResult(
             ok=False,
             output=f"[{error_type}] Tool execution pipeline crashed: {exc}\n"
@@ -397,33 +433,29 @@ def run_agent_turn(
                 _finish_turn()
                 return current_messages
 
-            # --- Concurrent tool execution ---
-            # Classify calls into concurrent-safe (read-only) vs serial (writes/commands)
+            # --- Tool execution ---
+            # _execute_single_tool now owns the full lifecycle (pre-hook,
+            # metrics, store, exec, store-idle, post-hook). Concurrent
+            # workers skip UI callbacks (transcript state is not thread-safe);
+            # the agent thread replays them after results return, in original
+            # call order.
             calls = next_step.calls
             _results: list[tuple[dict, ToolResult]] = []
 
             if len(calls) <= 1:
-                # Single call — no benefit from concurrency, run directly
                 call = calls[0]
-                if metrics_collector:
-                    metrics_collector.start_tool(call["toolName"])
                 result = _execute_single_tool(
                     call, tools, cwd, permissions, runtime, store, step,
-                    on_tool_start, on_tool_result,
+                    metrics_collector=metrics_collector,
+                    fire_ui_callbacks=True,
+                    on_tool_start=on_tool_start,
+                    on_tool_result=on_tool_result,
                 )
-                if metrics_collector:
-                    metrics_collector.end_tool(
-                        success=result.ok,
-                        error=result.output if not result.ok else "",
-                    )
                 _results.append((call, result))
             else:
-                # Multiple calls — use ToolScheduler for intelligent partitioning
                 concurrent_calls, serial_calls = tool_scheduler.schedule_calls(calls, tools)
 
-                _results: list[tuple[dict, ToolResult]] = []
-
-                # Phase 1: Run all concurrent-safe tools in parallel
+                # Phase 1: concurrent-safe tools in parallel
                 if concurrent_calls:
                     max_workers = tool_scheduler.get_recommended_max_workers(concurrent_calls)
                     with concurrent.futures.ThreadPoolExecutor(
@@ -433,8 +465,11 @@ def run_agent_turn(
                         future_to_call = {
                             pool.submit(
                                 _execute_single_tool,
-                                call, tools, cwd, permissions, runtime, None, step,
-                                None, None,  # No UI callbacks during concurrent phase
+                                call, tools, cwd, permissions, runtime, store, step,
+                                metrics_collector=metrics_collector,
+                                fire_ui_callbacks=False,
+                                on_tool_start=None,
+                                on_tool_result=None,
                             ): call
                             for call in concurrent_calls
                         }
@@ -446,64 +481,36 @@ def run_agent_turn(
                                 result = ToolResult(ok=False, output=f"Concurrent execution error: {exc}")
                             _results.append((call, result))
 
-                # Phase 2: Run serial tools sequentially (in original order)
+                # Phase 2: serial tools in original order
                 if serial_calls:
                     for call in serial_calls:
-                        if metrics_collector:
-                            metrics_collector.start_tool(call["toolName"])
                         result = _execute_single_tool(
                             call, tools, cwd, permissions, runtime, store, step,
-                            on_tool_start, on_tool_result,
+                            metrics_collector=metrics_collector,
+                            fire_ui_callbacks=True,
+                            on_tool_start=on_tool_start,
+                            on_tool_result=on_tool_result,
                         )
-                        if metrics_collector:
-                            metrics_collector.end_tool(
-                                success=result.ok,
-                                error=result.output if not result.ok else "",
-                            )
                         _results.append((call, result))
-                        # If a serial tool awaits user, return immediately
                         if result.awaitUser:
-                            # Still need to process remaining results for messages
                             break
-            
-            # Process all results and build messages (preserve original call order)
+
+            # Preserve original call order for message construction.
             call_order = {call["id"]: idx for idx, call in enumerate(calls)}
             _results.sort(key=lambda pair: call_order.get(pair[0]["id"], 999))
-            
+
             for call, result in _results:
-                # Fire hooks and UI callbacks for concurrent calls (deferred)
+                # Replay UI callbacks for concurrent-executed tools on the
+                # agent thread (transcript state is not thread-safe).
                 tool_def = tools.find(call["toolName"])
                 is_concurrent = tool_def and tool_def.is_concurrency_safe and len(calls) > 1
-                
+
                 if is_concurrent:
-                    # Deferred UI callbacks for concurrent tools
                     if on_tool_start:
                         on_tool_start(call["toolName"], call["input"])
-                    if store:
-                        store.set_state(set_busy(call["toolName"]))
-                        store.set_state(increment_tool_calls())
-                        store.set_state(set_idle())
-                    # Hook: pre-tool-use (fire after the fact for concurrent tools)
-                    fire_hook_sync(
-                        HookEvent.PRE_TOOL_USE,
-                        tool_name=call["toolName"],
-                        tool_input=call["input"],
-                        step=step,
-                    )
-                
-                # Hook: post-tool-use
-                fire_hook_sync(
-                    HookEvent.POST_TOOL_USE,
-                    tool_name=call["toolName"],
-                    tool_output=result.output,
-                    is_error=not result.ok,
-                    step=step,
-                )
-                
-                if is_concurrent:
                     if on_tool_result:
                         on_tool_result(call["toolName"], result.output, not result.ok)
-                
+
                 saw_tool_result = True
                 if not result.ok:
                     tool_error_count += 1

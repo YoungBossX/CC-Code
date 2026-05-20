@@ -3,8 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Protocol
-from abc import abstractmethod
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -163,41 +162,6 @@ class ToolMetadata:
         return ToolCapability.CONCURRENCY_SAFE in self.capabilities
 
 
-# ---------------------------------------------------------------------------
-# Tool Protocol (inspired by Claude Code's Tool interface)
-# ---------------------------------------------------------------------------
-
-class Tool(Protocol):
-    """Tool protocol defining a complete tool lifecycle.
-    
-    Inspired by Claude Code's Tool type which includes:
-    - call: Execution logic
-    - description: Dynamic description generation
-    - validate_input: Input validation
-    - check_permissions: Permission checking
-    - Metadata: is_read_only, is_destructive, etc.
-    """
-    
-    @property
-    def name(self) -> str: ...
-    
-    @property
-    def description_template(self) -> str: ...
-    
-    def get_description(self, args: dict[str, Any], options: dict[str, Any] | None = None) -> str: ...
-    def validate_input(self, args: dict[str, Any]) -> tuple[bool, str]: ...
-    def check_permissions(self, args: dict[str, Any], context: ToolContext) -> tuple[bool, str]: ...
-    def call(
-        self,
-        args: dict[str, Any],
-        context: ToolContext,
-        on_progress: Callable[[dict[str, Any]], None] | None = None,
-    ) -> ToolResult: ...
-    def is_enabled(self) -> bool: ...
-    def is_read_only(self, args: dict[str, Any]) -> bool: ...
-    def is_destructive(self, args: dict[str, Any]) -> bool: ...
-
-
 @dataclass(slots=True)
 class BackgroundTaskResult:
     taskId: str
@@ -238,12 +202,17 @@ class ToolDefinition:
     
     @property
     def is_read_only(self) -> bool:
-        """Check if this tool is read-only (safe for concurrent execution)."""
+        """Check if this tool is read-only (safe for concurrent execution).
+
+        Tools may declare their own ``metadata`` explicitly; otherwise we fall
+        back to ``DEFAULT_READ_ONLY_TOOL_NAMES`` below. The fallback is the
+        actual mechanism for all core tools today — none of them populate
+        ``metadata``. If you add a read-only tool, add its name here.
+        """
         if self.metadata:
             return self.metadata.is_read_only
-        # Fallback: heuristic based on tool name
-        return self.name in _READ_ONLY_TOOL_NAMES
-    
+        return self.name in DEFAULT_READ_ONLY_TOOL_NAMES
+
     @property
     def is_concurrency_safe(self) -> bool:
         """Check if this tool is safe for concurrent execution."""
@@ -252,13 +221,21 @@ class ToolDefinition:
         return self.is_read_only
 
 
-# Heuristic: tool names that are known to be read-only
-_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
+# Default set of tool names treated as read-only. This is the production
+# source of truth for concurrency scheduling — `agent_loop` partitions calls
+# using `ToolDefinition.is_concurrency_safe`, which for tools without an
+# explicit `metadata` resolves through this set.
+DEFAULT_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "grep_files", "file_tree",
     "find_symbols", "find_references", "get_ast_info",
     "code_review", "diff_viewer", "db_explorer",
     "web_fetch", "web_search", "api_tester",
     "ask_user", "todo_write",
+    # Pure-function utility tools (full profile only)
+    "json_parse", "json_format", "regex_test",
+    "base64_encode", "base64_decode", "url_encode", "url_decode",
+    "current_time", "timestamp", "hash", "hmac",
+    "uuid_generate", "line_count",
 })
 
 

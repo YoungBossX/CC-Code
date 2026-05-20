@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -92,6 +94,57 @@ def _matches_directory_prefix(target_path: str, directories: set[str]) -> bool:
 
 def _format_command_signature(command: str, args: list[str]) -> str:
     return " ".join([command, *args]).strip()
+
+
+# Substring patterns that flag the FULL command line as destructive, regardless
+# of how it's invoked (direct, behind cmd /c, behind bash -lc, etc.). Scanning
+# the raw string catches dangers buried in shell wrappers — e.g. `cmd /c "del /s /q *"`
+# would otherwise pass `_classify_dangerous_command("cmd", [...])` because cmd
+# itself isn't in any danger list.
+_RAW_COMMAND_DANGERS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\brm\s+-[A-Za-z]*r[A-Za-z]*f\b|\brm\s+-[A-Za-z]*f[A-Za-z]*r\b"), "rm -rf payload"),
+    (re.compile(r"\b(?:del|erase)\b[^|;&]*\s/(?:s|q)\b", re.IGNORECASE), "recursive Windows delete (del /s|/q)"),
+    (re.compile(r"\b(?:rmdir|rd)\b[^|;&]*\s/s\b", re.IGNORECASE), "recursive Windows directory removal (rd /s)"),
+    (re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sh|bash|zsh|fish)\b"), "downloads and pipes to shell"),
+    (re.compile(r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|]*\|\s*(?:iex|invoke-expression)\b", re.IGNORECASE), "downloads and pipes to PowerShell Invoke-Expression"),
+    (re.compile(r"\b(?:powershell|pwsh)\b[^|;&]*\b(?:iex|invoke-expression)\b", re.IGNORECASE), "PowerShell Invoke-Expression"),
+    (re.compile(r"\bgit\s+reset\s+--hard\b"), "git reset --hard discards local changes"),
+    (re.compile(r"\bgit\s+push\b[^|;&]*\s(?:--force|-f)\b"), "git push --force rewrites remote history"),
+    (re.compile(r"\bgit\s+clean\b"), "git clean deletes untracked files"),
+    (re.compile(r"\bgit\s+checkout\b[^|;&]*\s--\s"), "git checkout -- overwrites working tree"),
+    (re.compile(r"\breg\s+delete\b", re.IGNORECASE), "reg delete modifies the Windows registry"),
+    (re.compile(r"\bchmod\b[^|;&]*\b777\b"), "chmod 777 opens permissions to all users"),
+    (re.compile(r"\b(?:dd|mkfs(?:\.[a-z0-9]+)?|fdisk|format)\b"), "disk-level operation"),
+    (re.compile(r"\bdiskutil\b"), "diskutil can erase or partition disks"),
+    (re.compile(r"\bcsrutil\b"), "csrutil modifies System Integrity Protection"),
+    (re.compile(r"\bdefaults\s+write\b"), "defaults write modifies system preferences"),
+    (re.compile(r"\blaunchctl\s+(?:unload|bootout|disable)\b"), "launchctl can disable system services"),
+    (re.compile(r"\bdscl\b"), "dscl modifies directory services / user accounts"),
+    (re.compile(r"\bsudo\b"), "sudo escalates privileges"),
+    (re.compile(r"\bnpm\s+publish\b"), "npm publish affects an external registry"),
+]
+
+
+def classify_command_risk(raw_command: str, args: list[str] | None = None) -> str | None:
+    """Single entry-point for command danger classification.
+
+    Scans the RAW command string for known destructive patterns first — this
+    catches dangers regardless of whether the command will be invoked through a
+    shell wrapper. If the raw string is clean, falls back to argv-based
+    classification (legacy `_classify_dangerous_command`).
+
+    Returns a short reason string when the command is destructive, or None.
+    """
+    if not raw_command:
+        return None
+    for pattern, label in _RAW_COMMAND_DANGERS:
+        if pattern.search(raw_command):
+            return f"{label}: {raw_command.strip()[:200]}"
+    if args is not None and args:
+        head, *rest = args
+        if isinstance(head, str):
+            return _classify_dangerous_command(head, [str(a) for a in rest])
+    return None
 
 
 def _classify_dangerous_command(command: str, args: list[str]) -> str | None:
@@ -216,6 +269,12 @@ class PermissionManager:
         self.session_denied_edits: set[str] = set()
         self.turn_allowed_edits: set[str] = set()
         self.turn_allow_all_edits = False
+        # Protects the mutable decision sets. ensure_* methods are reachable
+        # from worker threads in agent_loop's concurrent tool execution path.
+        # RLock so a method can call self._persist() (which re-enters) safely.
+        # The prompt callback is invoked WITHOUT holding the lock so it
+        # cannot deadlock against UI input.
+        self._lock = threading.RLock()
         self._initialize()
 
     def _initialize(self) -> None:
@@ -228,24 +287,23 @@ class PermissionManager:
         self.denied_edit_patterns |= {_normalize_path(item) for item in store.get("deniedEditPatterns", [])}
 
     def begin_turn(self) -> None:
-        self.turn_allowed_edits.clear()
-        self.turn_allow_all_edits = False
+        with self._lock:
+            self.turn_allowed_edits.clear()
+            self.turn_allow_all_edits = False
 
     def end_turn(self) -> None:
         self.begin_turn()
 
     def get_summary(self) -> list[str]:
+        with self._lock:
+            allowed_dirs = sorted(self.allowed_directory_prefixes)[:4]
+            allowed_cmds = sorted(self.allowed_command_patterns)[:4]
+            trusted_edits = sorted(self.allowed_edit_patterns)[:2]
         summary = [f"cwd: {self.workspace_root}"]
-        summary.append(
-            "extra allowed dirs: "
-            + (", ".join(sorted(self.allowed_directory_prefixes)[:4]) if self.allowed_directory_prefixes else "none")
-        )
-        summary.append(
-            "dangerous allowlist: "
-            + (", ".join(sorted(self.allowed_command_patterns)[:4]) if self.allowed_command_patterns else "none")
-        )
-        if self.allowed_edit_patterns:
-            summary.append("trusted edit targets: " + ", ".join(sorted(self.allowed_edit_patterns)[:2]))
+        summary.append("extra allowed dirs: " + (", ".join(allowed_dirs) if allowed_dirs else "none"))
+        summary.append("dangerous allowlist: " + (", ".join(allowed_cmds) if allowed_cmds else "none"))
+        if trusted_edits:
+            summary.append("trusted edit targets: " + ", ".join(trusted_edits))
         return summary
 
     def _persist(self) -> None:
@@ -262,37 +320,33 @@ class PermissionManager:
 
     def ensure_path_access(self, target_path: str, intent: str) -> None:
         normalized_target = _normalize_path(target_path)
-        
-        # Fast path: check workspace root first (most common case)
-        # workspace_root is already normalized, so no need for Path.resolve() again
+
+        # Fast path: workspace_root is immutable after __init__, lock-free.
         if _is_within_directory(self.workspace_root, normalized_target):
             return
-        
-        # Check denial sets first (fail fast)
-        if normalized_target in self.session_denied_paths or _matches_directory_prefix(normalized_target, self.denied_directory_prefixes):
-            raise RuntimeError(f"Access denied for path outside cwd: {normalized_target}")
-        
-        # Check approval sets
-        if normalized_target in self.session_allowed_paths or _matches_directory_prefix(normalized_target, self.allowed_directory_prefixes):
-            return
-        if normalized_target in self.session_denied_paths or _matches_directory_prefix(normalized_target, self.denied_directory_prefixes):
-            raise RuntimeError(f"Access denied for path outside cwd: {normalized_target}")
-        if normalized_target in self.session_allowed_paths or _matches_directory_prefix(normalized_target, self.allowed_directory_prefixes):
-            return
-        
-        # Auto mode risk assessment for path access
+
+        # Cached decision check (sets are mutable — needs lock).
+        with self._lock:
+            if normalized_target in self.session_denied_paths or _matches_directory_prefix(normalized_target, self.denied_directory_prefixes):
+                raise RuntimeError(f"Access denied for path outside cwd: {normalized_target}")
+            if normalized_target in self.session_allowed_paths or _matches_directory_prefix(normalized_target, self.allowed_directory_prefixes):
+                return
+
+        # Auto mode risk assessment (no internal mutation).
         assessment = self.auto_checker.assess_risk("path_access", {"path": normalized_target, "intent": intent})
         if assessment.action == "approve":
             get_mode_state().record_decision("approve")
-            self.session_allowed_paths.add(normalized_target)
+            with self._lock:
+                self.session_allowed_paths.add(normalized_target)
             return
-        
+
         if self.prompt is None:
             raise RuntimeError(
                 f"Path {normalized_target} is outside cwd {self.workspace_root}. Start cc_code in TTY mode to approve it."
             )
 
         scope_directory = normalized_target if intent in {"list", "command_cwd"} else str(Path(normalized_target).parent)
+        # Prompt runs WITHOUT the lock so UI input can't deadlock other workers.
         result = self.prompt(
             {
                 "kind": "path",
@@ -312,18 +366,19 @@ class PermissionManager:
             }
         )
         decision = result.get("decision")
-        if decision == "allow_once":
-            self.session_allowed_paths.add(normalized_target)
-            return
-        if decision == "allow_always":
-            self.allowed_directory_prefixes.add(scope_directory)
-            self._persist()
-            return
-        if decision == "deny_always":
-            self.denied_directory_prefixes.add(scope_directory)
-            self._persist()
-        else:
-            self.session_denied_paths.add(normalized_target)
+        with self._lock:
+            if decision == "allow_once":
+                self.session_allowed_paths.add(normalized_target)
+                return
+            if decision == "allow_always":
+                self.allowed_directory_prefixes.add(scope_directory)
+                self._persist()
+                return
+            if decision == "deny_always":
+                self.denied_directory_prefixes.add(scope_directory)
+                self._persist()
+            else:
+                self.session_denied_paths.add(normalized_target)
         raise RuntimeError(f"Access denied for path outside cwd: {normalized_target}")
 
     def ensure_command(
@@ -347,21 +402,23 @@ class PermissionManager:
             # action == "prompt" — fall through to normal approval flow
             return
         signature = _format_command_signature(command, args)
-        if signature in self.session_denied_commands or signature in self.denied_command_patterns:
-            raise RuntimeError(f"Command denied: {signature}")
-        if signature in self.session_allowed_commands or signature in self.allowed_command_patterns:
-            return
-        
+        with self._lock:
+            if signature in self.session_denied_commands or signature in self.denied_command_patterns:
+                raise RuntimeError(f"Command denied: {signature}")
+            if signature in self.session_allowed_commands or signature in self.allowed_command_patterns:
+                return
+
         # Auto mode risk assessment for dangerous commands
         assessment = self.auto_checker.assess_risk("run_command", {"command": [command] + args})
         if assessment.action == "approve":
             get_mode_state().record_decision("approve")
-            self.session_allowed_commands.add(signature)
+            with self._lock:
+                self.session_allowed_commands.add(signature)
             return
         if assessment.action == "block":
             get_mode_state().record_decision("block")
             raise RuntimeError(f"Command blocked by auto mode: {assessment.reason}")
-        
+
         if self.prompt is None:
             raise RuntimeError(f"Command requires approval: {signature}. Start cc_code in TTY mode to approve it.")
         # Distinguish forced prompts (external trigger) from dangerous commands
@@ -370,6 +427,7 @@ class PermissionManager:
             if not force_prompt_reason
             else "cc-code wants approval for this command"
         )
+        # Prompt runs without the lock so the UI doesn't block other workers.
         result = self.prompt(
             {
                 "kind": "command",
@@ -385,47 +443,51 @@ class PermissionManager:
             }
         )
         decision = result.get("decision")
-        if decision == "allow_once":
-            self.session_allowed_commands.add(signature)
-            return
-        if decision == "allow_always":
-            self.allowed_command_patterns.add(signature)
-            self._persist()
-            return
-        if decision == "deny_always":
-            self.denied_command_patterns.add(signature)
-            self._persist()
-        else:
-            self.session_denied_commands.add(signature)
+        with self._lock:
+            if decision == "allow_once":
+                self.session_allowed_commands.add(signature)
+                return
+            if decision == "allow_always":
+                self.allowed_command_patterns.add(signature)
+                self._persist()
+                return
+            if decision == "deny_always":
+                self.denied_command_patterns.add(signature)
+                self._persist()
+            else:
+                self.session_denied_commands.add(signature)
         raise RuntimeError(f"Command denied: {signature}")
 
     def ensure_edit(self, target_path: str, diff_preview: str) -> None:
         normalized_target = _normalize_path(target_path)
-        if (
-            normalized_target in self.session_denied_edits
-            or normalized_target in self.denied_edit_patterns
-        ):
-            raise RuntimeError(f"Edit denied: {normalized_target}")
-        if (
-            normalized_target in self.session_allowed_edits
-            or normalized_target in self.turn_allowed_edits
-            or self.turn_allow_all_edits
-            or normalized_target in self.allowed_edit_patterns
-        ):
-            return
-        
+        with self._lock:
+            if (
+                normalized_target in self.session_denied_edits
+                or normalized_target in self.denied_edit_patterns
+            ):
+                raise RuntimeError(f"Edit denied: {normalized_target}")
+            if (
+                normalized_target in self.session_allowed_edits
+                or normalized_target in self.turn_allowed_edits
+                or self.turn_allow_all_edits
+                or normalized_target in self.allowed_edit_patterns
+            ):
+                return
+
         # Auto mode risk assessment for file edits
         assessment = self.auto_checker.assess_risk("edit_file", {"path": normalized_target})
         if assessment.action == "approve":
             get_mode_state().record_decision("approve")
-            self.session_allowed_edits.add(normalized_target)
+            with self._lock:
+                self.session_allowed_edits.add(normalized_target)
             return
         if assessment.action == "block":
             get_mode_state().record_decision("block")
             raise RuntimeError(f"Edit blocked by auto mode: {assessment.reason}")
-        
+
         if self.prompt is None:
             raise RuntimeError(f"Edit requires approval: {normalized_target}. Start cc_code in TTY mode to review it.")
+        # Prompt runs without the lock; UI input can take arbitrarily long.
         result = self.prompt(
             {
                 "kind": "edit",
@@ -444,63 +506,29 @@ class PermissionManager:
             }
         )
         decision = result.get("decision")
-        if decision == "allow_once":
-            self.session_allowed_edits.add(normalized_target)
-            return
-        if decision == "allow_turn":
-            self.turn_allowed_edits.add(normalized_target)
-            return
-        if decision == "allow_all_turn":
-            self.turn_allow_all_edits = True
-            return
-        if decision == "allow_always":
-            self.allowed_edit_patterns.add(normalized_target)
-            self._persist()
-            return
-        if decision == "deny_with_feedback":
-            guidance = str(result.get("feedback", "")).strip()
-            if guidance:
-                raise RuntimeError(f"Edit denied: {normalized_target}\nUser guidance: {guidance}")
-        if decision == "deny_always":
-            self.denied_edit_patterns.add(normalized_target)
-            self._persist()
-        else:
-            self.session_denied_edits.add(normalized_target)
+        with self._lock:
+            if decision == "allow_once":
+                self.session_allowed_edits.add(normalized_target)
+                return
+            if decision == "allow_turn":
+                self.turn_allowed_edits.add(normalized_target)
+                return
+            if decision == "allow_all_turn":
+                self.turn_allow_all_edits = True
+                return
+            if decision == "allow_always":
+                self.allowed_edit_patterns.add(normalized_target)
+                self._persist()
+                return
+            if decision == "deny_with_feedback":
+                guidance = str(result.get("feedback", "")).strip()
+                if guidance:
+                    raise RuntimeError(f"Edit denied: {normalized_target}\nUser guidance: {guidance}")
+            if decision == "deny_always":
+                self.denied_edit_patterns.add(normalized_target)
+                self._persist()
+            else:
+                self.session_denied_edits.add(normalized_target)
         raise RuntimeError(f"Edit denied: {normalized_target}")
 
 
-class PermissionGate:
-    """Explicit permission gate for critical actions.
-
-    Provides a declarative way to check permissions before executing
-    high-risk operations (file writes, command execution, network requests).
-
-    Usage:
-        gate = PermissionGate(permissions, cwd)
-        gate.check_file_write("src/main.py")
-        gate.check_command_run("rm -rf /tmp")
-    """
-
-    def __init__(
-        self,
-        permissions: PermissionManager,
-        cwd: str,
-    ) -> None:
-        self.permissions = permissions
-        self.cwd = cwd
-
-    def check_path_access(self, target_path: str, intent: str) -> None:
-        """Gate for path access (read/write/list/search)."""
-        self.permissions.ensure_path_access(target_path, intent)
-
-    def check_file_write(self, target_path: str) -> None:
-        """Gate specifically for file write operations."""
-        self.check_path_access(target_path, "write")
-
-    def check_command_run(self, command: str, args: list[str]) -> None:
-        """Gate for command execution."""
-        self.permissions.ensure_command(command, args, self.cwd)
-
-    def check_file_edit(self, target_path: str, diff_preview: str) -> None:
-        """Gate for file edit operations with diff preview."""
-        self.permissions.ensure_edit(target_path, diff_preview)

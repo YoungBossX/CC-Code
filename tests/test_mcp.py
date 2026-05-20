@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-import cc_code.mcp as mcp_module
 from cc_code.mcp import StdioMcpClient, create_mcp_backed_tools
+from cc_code.mcp import _helpers as mcp_helpers
 from cc_code.tooling import ToolContext
 
 
@@ -85,7 +85,7 @@ def test_oversized_payload_is_rejected_without_leaking_pending_request(
 ) -> None:
     client = _client(tmp_path, mode="oversized_payload")
     client.start()
-    monkeypatch.setattr(mcp_module, "MAX_MCP_PAYLOAD_BYTES", 64)
+    monkeypatch.setattr(mcp_helpers, "MAX_MCP_PAYLOAD_BYTES", 64)
 
     with pytest.raises(RuntimeError, match="request timed out"):
         client.request("tools/call", {"name": "echo", "arguments": {"text": "hi"}}, timeout_seconds=0.1)

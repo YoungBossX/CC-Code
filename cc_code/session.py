@@ -1,26 +1,26 @@
 """Session persistence and resume module.
 
-Provides session data structures, autosave mechanism, and resume capabilities
-to allow CC-Coder to save and restore conversation state across restarts.
+Sessions are stored as append-only JSONL files: one line per record (header,
+message, transcript entry, history entry, meta_update). Resume = read the
+file linewise and replay. No delta files, no consolidation, no MD5 change
+hashes — append-only avoids all of that complexity.
 
-Uses incremental delta saves to reduce serialization overhead:
-- Only new/changed messages are appended since last save
-- Full save occurs periodically (every N deltas) for consistency
-- Dirty tracking at field level avoids redundant serialization
+Legacy sessions (``{id}.json`` + ``deltas/{id}/delta_*.json``) are still
+loadable; new saves only ever write ``{id}.jsonl``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from cc_code.config import CC_CODE_DIR
+from cc_code.io_atomic import atomic_write_text
 
 
 # ---------------------------------------------------------------------------
@@ -30,10 +30,8 @@ from cc_code.config import CC_CODE_DIR
 SESSIONS_DIR = CC_CODE_DIR / "sessions"
 AUTOSAVE_INTERVAL_SECONDS = 30  # Minimum seconds between autosaves
 
-# Incremental save configuration
-DELTA_DIR_NAME = "deltas"        # Subdirectory for delta files
-FULL_SAVE_INTERVAL = 10          # Do a full save every N delta saves
-MAX_DELTA_FILES = 50             # Maximum delta files before forced consolidation
+# Legacy delta layout. Kept only for read-side migration.
+DELTA_DIR_NAME = "deltas"
 
 
 # ---------------------------------------------------------------------------
@@ -66,12 +64,12 @@ class SessionData:
     skills: list[dict[str, Any]] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     metadata: SessionMetadata = field(default=None)
-    
-    # Incremental save tracking
-    _last_saved_msg_count: int = field(default=0, repr=False)
-    _last_saved_transcript_count: int = field(default=0, repr=False)
-    _delta_save_count: int = field(default=0, repr=False)
-    _last_full_save_hash: str = field(default="", repr=False)
+
+    # Append-only save tracking — how much has already been flushed to disk.
+    _saved_msg_count: int = field(default=0, repr=False)
+    _saved_transcript_count: int = field(default=0, repr=False)
+    _saved_history_count: int = field(default=0, repr=False)
+    _saved_meta_signature: tuple = field(default=(), repr=False)
 
     def __post_init__(self):
         if self.metadata is None:
@@ -89,76 +87,78 @@ class SessionData:
         self.metadata.updated_at = self.updated_at
         self.metadata.message_count = len(self.messages)
 
-        # Extract first user message (truncated)
+        # First user message (truncated)
         for msg in self.messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
-                self.metadata.first_message = content[:100]
+                self.metadata.first_message = content[:100] if isinstance(content, str) else ""
                 break
 
-        # Extract last message (truncated)
+        # Last user/assistant message (truncated)
         for msg in reversed(self.messages):
             if msg.get("role") in ("user", "assistant"):
                 content = msg.get("content", "")
-                self.metadata.last_message = content[:100]
+                self.metadata.last_message = content[:100] if isinstance(content, str) else ""
                 break
-    
+
     @property
     def has_delta(self) -> bool:
-        """Check if there are unsaved changes."""
+        """Whether there are unsaved changes since the last save."""
         return (
-            len(self.messages) != self._last_saved_msg_count
-            or len(self.transcript_entries) != self._last_saved_transcript_count
+            len(self.messages) != self._saved_msg_count
+            or len(self.transcript_entries) != self._saved_transcript_count
+            or len(self.history) != self._saved_history_count
+            or self._current_meta_signature() != self._saved_meta_signature
         )
-    
-    def _compute_content_hash(self) -> str:
-        """Compute a quick hash of message content for change detection."""
-        h = hashlib.md5(usedforsecurity=False)
-        for msg in self.messages[-20:]:  # Hash last 20 messages for speed
-            h.update(msg.get("role", "").encode())
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                h.update(content[:500].encode())
-        return h.hexdigest()
+
+    def _current_meta_signature(self) -> tuple:
+        # A hashable fingerprint of fields that can change mid-session and
+        # are stored as meta_update records (not as append-only entries).
+        return (
+            json.dumps(self.permissions_summary, sort_keys=True),
+            json.dumps(self.skills, sort_keys=True),
+            json.dumps(self.mcp_servers, sort_keys=True),
+        )
 
 
 # ---------------------------------------------------------------------------
-# Session file operations
+# File paths
 # ---------------------------------------------------------------------------
 
 def _session_file(session_id: str) -> Path:
-    """Return path to a session JSON file."""
+    """New JSONL path for a session."""
+    return SESSIONS_DIR / f"{session_id}.jsonl"
+
+
+def _legacy_session_file(session_id: str) -> Path:
+    """Legacy full-save JSON path. Read-only — never written by this module."""
     return SESSIONS_DIR / f"{session_id}.json"
 
 
-def _session_delta_dir(session_id: str) -> Path:
-    """Return path to a session's delta directory."""
+def _legacy_delta_dir(session_id: str) -> Path:
     return SESSIONS_DIR / DELTA_DIR_NAME / session_id
 
 
 def _session_index_file() -> Path:
-    """Return path to the session index file."""
     return CC_CODE_DIR / "sessions_index.json"
 
 
+# ---------------------------------------------------------------------------
+# Session index (lightweight metadata for fast listing)
+# ---------------------------------------------------------------------------
+
 def _load_session_index() -> dict[str, SessionMetadata]:
-    """Load the session index (lightweight metadata for all sessions)."""
     index_path = _session_index_file()
     if not index_path.exists():
         return {}
     try:
-        raw = index_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        return {
-            sid: SessionMetadata(**meta)
-            for sid, meta in data.items()
-        }
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        return {sid: SessionMetadata(**meta) for sid, meta in data.items()}
     except (json.JSONDecodeError, TypeError, KeyError):
         return {}
 
 
 def _save_session_index(index: dict[str, SessionMetadata]) -> None:
-    """Save the session index."""
     CC_CODE_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     serializable = {
@@ -173,169 +173,194 @@ def _save_session_index(index: dict[str, SessionMetadata]) -> None:
         }
         for sid, meta in index.items()
     }
-    _session_index_file().write_text(
+    atomic_write_text(
+        _session_index_file(),
         json.dumps(serializable, indent=2) + "\n",
-        encoding="utf-8",
     )
 
 
-def _save_delta(session: SessionData) -> None:
-    """Save only the incremental changes since last full save.
-    
-    Delta files contain new messages and transcript entries appended
-    since the last save point. This is much cheaper than serializing
-    the entire session on every autosave.
-    """
-    delta_dir = _session_delta_dir(session.session_id)
-    delta_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Collect new messages since last save
-    new_messages = session.messages[session._last_saved_msg_count:]
-    new_transcripts = session.transcript_entries[session._last_saved_transcript_count:]
-    
-    if not new_messages and not new_transcripts:
-        return
-    
-    # Create delta entry
-    delta_data: dict[str, Any] = {
-        "ts": time.time(),
-        "msg_offset": session._last_saved_msg_count,
-        "transcript_offset": session._last_saved_transcript_count,
-    }
-    if new_messages:
-        delta_data["messages"] = new_messages
-    if new_transcripts:
-        delta_data["transcripts"] = new_transcripts
-    
-    # Write delta file with sequential numbering
-    delta_num = session._delta_save_count
-    delta_path = delta_dir / f"delta_{delta_num:04d}.json"
-    delta_path.write_text(
-        json.dumps(delta_data, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    
-    # Update tracking
-    session._last_saved_msg_count = len(session.messages)
-    session._last_saved_transcript_count = len(session.transcript_entries)
-    session._delta_save_count += 1
+# ---------------------------------------------------------------------------
+# JSONL save / load
+# ---------------------------------------------------------------------------
 
+def _write_jsonl_lines(path: Path, lines: list[dict[str, Any]], *, mode: str) -> None:
+    """Write one JSON record per line. mode='a' for append, 'w' for rewrite.
 
-def _consolidate_deltas(session: SessionData) -> None:
-    """Merge all delta files into the full session file and clean up.
-    
-    This is called periodically to prevent unbounded delta file growth
-    and to ensure the full session file stays consistent.
+    For append mode we flush + fsync so a crash mid-line doesn't leave a
+    partial record. For rewrite mode we go through atomic_write_text.
     """
-    delta_dir = _session_delta_dir(session.session_id)
-    if not delta_dir.exists():
+    if mode == "w":
+        body = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
+        atomic_write_text(path, body)
         return
-    
-    # Deltas are already applied during load_session, so just clean up
-    for delta_file in sorted(delta_dir.glob("delta_*.json")):
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        for line in lines:
+            f.write(json.dumps(line, ensure_ascii=False))
+            f.write("\n")
+        f.flush()
         try:
-            delta_file.unlink()
+            os.fsync(f.fileno())
         except OSError:
             pass
-    
-    # Try to remove empty delta directory
-    try:
-        delta_dir.rmdir()
-        # Also try to remove parent if empty
-        parent = delta_dir.parent
-        if parent.name == DELTA_DIR_NAME and not any(parent.iterdir()):
-            parent.rmdir()
-    except OSError:
-        pass
-    
-    session._delta_save_count = 0
+
+
+def _build_header_record(session: SessionData) -> dict[str, Any]:
+    return {
+        "type": "header",
+        "session_id": session.session_id,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "workspace": session.workspace,
+    }
+
+
+def _build_meta_update_record(session: SessionData) -> dict[str, Any]:
+    return {
+        "type": "meta_update",
+        "permissions_summary": session.permissions_summary,
+        "skills": session.skills,
+        "mcp_servers": session.mcp_servers,
+    }
 
 
 def save_session(session: SessionData, force_full: bool = False) -> None:
-    """Persist session to disk with incremental delta support.
-    
-    Uses a hybrid strategy:
-    - Delta saves: Only append new messages/transcripts (fast, small I/O)
-    - Full saves: Serialize entire session (slower, but ensures consistency)
-    - Consolidation: Merge deltas into full file periodically
-    
-    Args:
-        session: The session to save
-        force_full: Force a full save (e.g., on explicit save command)
+    """Persist session state to disk.
+
+    Default behavior: append-only — only new messages / transcript entries /
+    history entries (plus a meta_update record if skills / permissions /
+    mcp_servers changed) are appended to ``{id}.jsonl``.
+
+    ``force_full=True`` rewrites the whole file atomically. Use this on
+    explicit "save" or at session finalize to ensure a single clean file.
     """
     session.update_metadata()
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Decide whether to do a full save or delta save
-    should_full_save = (
-        force_full
-        or session._delta_save_count == 0  # First save is always full
-        or session._delta_save_count >= FULL_SAVE_INTERVAL
-        or session._delta_save_count >= MAX_DELTA_FILES  # Safety cap
-    )
-    
-    if should_full_save:
-        # Full save: serialize everything
-        session_path = _session_file(session.session_id)
-        serializable = {
-            "session_id": session.session_id,
-            "created_at": session.created_at,
-            "updated_at": session.updated_at,
-            "workspace": session.workspace,
-            "messages": session.messages,
-            "transcript_entries": session.transcript_entries,
-            "history": session.history,
-            "permissions_summary": session.permissions_summary,
-            "skills": session.skills,
-            "mcp_servers": session.mcp_servers,
-            "metadata": {
-                "session_id": session.metadata.session_id,
-                "created_at": session.metadata.created_at,
-                "updated_at": session.metadata.updated_at,
-                "first_message": session.metadata.first_message,
-                "last_message": session.metadata.last_message,
-                "message_count": session.metadata.message_count,
-                "workspace": session.metadata.workspace,
-            },
-        }
-        session_path.write_text(
-            json.dumps(serializable, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        
-        # Reset delta tracking
-        session._last_saved_msg_count = len(session.messages)
-        session._last_saved_transcript_count = len(session.transcript_entries)
-        session._last_full_save_hash = session._compute_content_hash()
-        
-        # Consolidate and clean up delta files
-        _consolidate_deltas(session)
+    target = _session_file(session.session_id)
+
+    # Fresh SessionData with the same id (no prior save tracked) → rewrite
+    # rather than append, otherwise we'd duplicate every message that was
+    # already on disk from a previous save.
+    fresh_state = session._saved_msg_count == 0 and not session._saved_transcript_count
+    if force_full or not target.exists() or fresh_state:
+        # Rewrite mode: produce the full canonical record set.
+        records: list[dict[str, Any]] = [_build_header_record(session)]
+        for msg in session.messages:
+            records.append({"type": "message", "data": msg})
+        for entry in session.transcript_entries:
+            records.append({"type": "transcript", "data": entry})
+        for h in session.history:
+            records.append({"type": "history", "data": h})
+        if session.permissions_summary or session.skills or session.mcp_servers:
+            records.append(_build_meta_update_record(session))
+        _write_jsonl_lines(target, records, mode="w")
+
+        session._saved_msg_count = len(session.messages)
+        session._saved_transcript_count = len(session.transcript_entries)
+        session._saved_history_count = len(session.history)
+        session._saved_meta_signature = session._current_meta_signature()
     else:
-        # Delta save: only append new data
-        _save_delta(session)
-    
-    # Update index (always lightweight)
+        # Append mode: only the diff since last save.
+        new_records: list[dict[str, Any]] = []
+        for msg in session.messages[session._saved_msg_count:]:
+            new_records.append({"type": "message", "data": msg})
+        for entry in session.transcript_entries[session._saved_transcript_count:]:
+            new_records.append({"type": "transcript", "data": entry})
+        for h in session.history[session._saved_history_count:]:
+            new_records.append({"type": "history", "data": h})
+
+        current_meta = session._current_meta_signature()
+        if current_meta != session._saved_meta_signature:
+            new_records.append(_build_meta_update_record(session))
+
+        if new_records:
+            _write_jsonl_lines(target, new_records, mode="a")
+            session._saved_msg_count = len(session.messages)
+            session._saved_transcript_count = len(session.transcript_entries)
+            session._saved_history_count = len(session.history)
+            session._saved_meta_signature = current_meta
+
+    # Update lightweight index (used by list_sessions)
     index = _load_session_index()
     index[session.session_id] = session.metadata
     _save_session_index(index)
 
 
-def load_session(session_id: str) -> SessionData | None:
-    """Load a session from disk, applying any pending deltas.
-    
-    Loading process:
-    1. Load the base session file
-    2. Scan for delta files
-    3. Apply deltas in order (append new messages/transcripts)
-    4. Update tracking counters
-    """
-    session_path = _session_file(session_id)
-    if not session_path.exists():
+def _load_jsonl_session(session_id: str) -> SessionData | None:
+    target = _session_file(session_id)
+    if not target.exists():
+        return None
+    try:
+        session: SessionData | None = None
+        messages: list[dict[str, Any]] = []
+        transcripts: list[dict[str, Any]] = []
+        history: list[str] = []
+        permissions_summary: dict[str, Any] = {}
+        skills: list[dict[str, Any]] = []
+        mcp_servers: list[dict[str, Any]] = []
+
+        with open(target, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip the corrupted line and keep going — append-only
+                    # storage means later lines are still valid.
+                    continue
+                rtype = record.get("type")
+                if rtype == "header":
+                    session = SessionData(
+                        session_id=record["session_id"],
+                        created_at=record["created_at"],
+                        updated_at=record["updated_at"],
+                        workspace=record.get("workspace", ""),
+                    )
+                elif rtype == "message":
+                    messages.append(record["data"])
+                elif rtype == "transcript":
+                    transcripts.append(record["data"])
+                elif rtype == "history":
+                    history.append(record["data"])
+                elif rtype == "meta_update":
+                    permissions_summary = record.get("permissions_summary", permissions_summary)
+                    skills = record.get("skills", skills)
+                    mcp_servers = record.get("mcp_servers", mcp_servers)
+                # Unknown record types are ignored (forward-compatible).
+
+        if session is None:
+            return None
+
+        session.messages = messages
+        session.transcript_entries = transcripts
+        session.history = history
+        session.permissions_summary = permissions_summary
+        session.skills = skills
+        session.mcp_servers = mcp_servers
+        session._saved_msg_count = len(messages)
+        session._saved_transcript_count = len(transcripts)
+        session._saved_history_count = len(history)
+        session._saved_meta_signature = session._current_meta_signature()
+        session.update_metadata()
+        return session
+    except OSError:
         return None
 
+
+def _load_legacy_session(session_id: str) -> SessionData | None:
+    """Read the old ``{id}.json`` + ``deltas/{id}/delta_*.json`` layout.
+
+    Used only when no JSONL file exists for the id. After loading, callers
+    can choose to resave; the next save will produce a ``.jsonl`` file.
+    """
+    legacy_path = _legacy_session_file(session_id)
+    if not legacy_path.exists():
+        return None
     try:
-        raw = session_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
+        data = json.loads(legacy_path.read_text(encoding="utf-8"))
         metadata = SessionMetadata(**data.get("metadata", {}))
         session = SessionData(
             session_id=data["session_id"],
@@ -350,49 +375,47 @@ def load_session(session_id: str) -> SessionData | None:
             mcp_servers=data.get("mcp_servers", []),
             metadata=metadata,
         )
-        
-        # Apply any pending deltas
-        delta_dir = _session_delta_dir(session_id)
-        if delta_dir.exists():
-            delta_files = sorted(delta_dir.glob("delta_*.json"))
-            for delta_path in delta_files:
-                try:
-                    delta_raw = delta_path.read_text(encoding="utf-8")
-                    delta = json.loads(delta_raw)
-                    
-                    # Append delta messages at the correct offset
-                    if "messages" in delta:
-                        offset = delta.get("msg_offset", len(session.messages))
-                        # Ensure we don't duplicate messages
-                        if offset >= len(session.messages):
-                            session.messages.extend(delta["messages"])
-                        elif offset + len(delta["messages"]) > len(session.messages):
-                            # Partial overlap — append only the new part
-                            overlap = len(session.messages) - offset
-                            session.messages.extend(delta["messages"][overlap:])
-                    
-                    # Append delta transcripts
-                    if "transcripts" in delta:
-                        t_offset = delta.get("transcript_offset", len(session.transcript_entries))
-                        if t_offset >= len(session.transcript_entries):
-                            session.transcript_entries.extend(delta["transcripts"])
-                        elif t_offset + len(delta["transcripts"]) > len(session.transcript_entries):
-                            overlap = len(session.transcript_entries) - t_offset
-                            session.transcript_entries.extend(delta["transcripts"][overlap:])
-                    
-                    session._delta_save_count += 1
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    # Skip corrupt delta files
-                    continue
-        
-        # Update tracking counters
-        session._last_saved_msg_count = len(session.messages)
-        session._last_saved_transcript_count = len(session.transcript_entries)
-        session._last_full_save_hash = session._compute_content_hash()
-        
-        return session
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
+
+    # Apply legacy deltas if present.
+    delta_dir = _legacy_delta_dir(session_id)
+    if delta_dir.exists():
+        for delta_path in sorted(delta_dir.glob("delta_*.json")):
+            try:
+                delta = json.loads(delta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            new_msgs = delta.get("messages")
+            if new_msgs:
+                offset = delta.get("msg_offset", len(session.messages))
+                if offset >= len(session.messages):
+                    session.messages.extend(new_msgs)
+                elif offset + len(new_msgs) > len(session.messages):
+                    overlap = len(session.messages) - offset
+                    session.messages.extend(new_msgs[overlap:])
+            new_ts = delta.get("transcripts")
+            if new_ts:
+                offset = delta.get("transcript_offset", len(session.transcript_entries))
+                if offset >= len(session.transcript_entries):
+                    session.transcript_entries.extend(new_ts)
+                elif offset + len(new_ts) > len(session.transcript_entries):
+                    overlap = len(session.transcript_entries) - offset
+                    session.transcript_entries.extend(new_ts[overlap:])
+
+    session._saved_msg_count = len(session.messages)
+    session._saved_transcript_count = len(session.transcript_entries)
+    session._saved_history_count = len(session.history)
+    session._saved_meta_signature = session._current_meta_signature()
+    return session
+
+
+def load_session(session_id: str) -> SessionData | None:
+    """Load a session by id. Tries new JSONL format first, then legacy."""
+    session = _load_jsonl_session(session_id)
+    if session is not None:
+        return session
+    return _load_legacy_session(session_id)
 
 
 def list_sessions() -> list[SessionMetadata]:
@@ -404,19 +427,44 @@ def list_sessions() -> list[SessionMetadata]:
 
 
 def delete_session(session_id: str) -> bool:
-    """Delete a session from disk. Returns True if deleted."""
-    session_path = _session_file(session_id)
-    if not session_path.exists():
-        return False
+    """Delete a session from disk (new + legacy paths). Returns True if anything was removed."""
+    removed = False
 
-    try:
-        session_path.unlink()
+    target = _session_file(session_id)
+    if target.exists():
+        try:
+            target.unlink()
+            removed = True
+        except OSError:
+            pass
+
+    legacy = _legacy_session_file(session_id)
+    if legacy.exists():
+        try:
+            legacy.unlink()
+            removed = True
+        except OSError:
+            pass
+
+    delta_dir = _legacy_delta_dir(session_id)
+    if delta_dir.exists():
+        for f in delta_dir.glob("delta_*.json"):
+            try:
+                f.unlink()
+                removed = True
+            except OSError:
+                pass
+        try:
+            delta_dir.rmdir()
+        except OSError:
+            pass
+
+    if removed:
         index = _load_session_index()
-        index.pop(session_id, None)
-        _save_session_index(index)
-        return True
-    except OSError:
-        return False
+        if index.pop(session_id, None) is not None:
+            _save_session_index(index)
+
+    return removed
 
 
 def cleanup_old_sessions(max_sessions: int = 50) -> int:
@@ -463,50 +511,39 @@ def get_latest_session(workspace: str | None = None) -> SessionData | None:
 # ---------------------------------------------------------------------------
 
 class AutosaveManager:
-    """Manages automatic session saving with rate limiting and delta support.
-    
-    Uses incremental saves for autosave (fast) and full saves for
-    explicit save commands (consistent).
+    """Periodic save with dirty tracking.
+
+    Append-only storage means even the periodic save is cheap (it only writes
+    what changed since last save). ``force_save`` does a full rewrite to
+    consolidate any meta drift.
     """
 
     def __init__(self, session: SessionData, interval: int = AUTOSAVE_INTERVAL_SECONDS):
         self.session = session
         self.interval = interval
-        self._last_save_time = time.time()  # Initialize to current time
+        self._last_save_time = time.time()
         self._dirty = False
-        self._full_save_counter = 0
 
     def mark_dirty(self) -> None:
-        """Mark session as needing save."""
         self._dirty = True
 
     def should_save(self) -> bool:
-        """Check if autosave should trigger."""
         if not self._dirty:
             return False
-        elapsed = time.time() - self._last_save_time
-        return elapsed >= self.interval
+        return (time.time() - self._last_save_time) >= self.interval
 
     def save_if_needed(self) -> bool:
-        """Save if dirty and interval elapsed. Uses delta saves for speed.
-        
-        Returns True if saved.
-        """
         if self.should_save():
-            # Use incremental delta save for autosave (fast)
             save_session(self.session, force_full=False)
             self._last_save_time = time.time()
             self._dirty = False
-            self._full_save_counter += 1
             return True
         return False
 
     def force_save(self) -> None:
-        """Force immediate full save regardless of interval."""
         save_session(self.session, force_full=True)
         self._last_save_time = time.time()
         self._dirty = False
-        self._full_save_counter = 0
 
 
 # ---------------------------------------------------------------------------
@@ -514,44 +551,34 @@ class AutosaveManager:
 # ---------------------------------------------------------------------------
 
 def format_session_list(sessions: list[SessionMetadata]) -> str:
-    """Format sessions as a human-readable list."""
+    """Format a list of sessions for terminal display."""
     if not sessions:
         return "No saved sessions found."
 
     lines = ["Saved sessions:", ""]
-    for i, meta in enumerate(sessions, 1):
-        created = time.strftime(
-            "%Y-%m-%d %H:%M",
-            time.localtime(meta.created_at),
-        )
-        workspace = meta.workspace or "unknown"
-        first_msg = meta.first_message or "(empty)"
-        count = meta.message_count
-
+    for meta in sessions[:20]:  # show up to 20
+        age_seconds = time.time() - meta.updated_at
+        if age_seconds < 60:
+            age = f"{int(age_seconds)}s ago"
+        elif age_seconds < 3600:
+            age = f"{int(age_seconds / 60)}m ago"
+        elif age_seconds < 86400:
+            age = f"{int(age_seconds / 3600)}h ago"
+        else:
+            age = f"{int(age_seconds / 86400)}d ago"
+        first = meta.first_message[:60] + ("…" if len(meta.first_message) > 60 else "")
         lines.append(
-            f"  {i}. [{meta.session_id[:8]}] {created} - {workspace}"
+            f"  [{meta.session_id[:8]}] {age:>10}  {meta.message_count:>3} msgs  {first}"
         )
-        lines.append(f"     Messages: {count} | First: {first_msg}")
-        lines.append("")
-
-    lines.append(f"Total: {len(sessions)} session(s)")
     return "\n".join(lines)
 
 
 def format_session_resume(session: SessionData) -> str:
-    """Format session info for resume confirmation."""
-    created = time.strftime(
-        "%Y-%m-%d %H:%M:%S",
-        time.localtime(session.created_at),
-    )
-    updated = time.strftime(
-        "%Y-%m-%d %H:%M:%S",
-        time.localtime(session.updated_at),
-    )
-    return (
-        f"Resuming session {session.session_id[:8]}\n"
-        f"  Created: {created}\n"
-        f"  Updated: {updated}\n"
-        f"  Messages: {len(session.messages)}\n"
-        f"  Workspace: {session.workspace}"
-    )
+    """Format session info shown when resuming."""
+    lines = [
+        f"Resuming session [{session.session_id[:8]}]",
+        f"  workspace: {session.workspace}",
+        f"  messages: {len(session.messages)}",
+        f"  transcript entries: {len(session.transcript_entries)}",
+    ]
+    return "\n".join(lines)
