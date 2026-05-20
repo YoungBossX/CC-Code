@@ -24,17 +24,31 @@ collect_ignore_glob = [
 
 @pytest.fixture(autouse=True)
 def isolate_cc_code_dirs(tmp_path, monkeypatch):
-    """Redirect user-scoped runtime data into the test temp directory."""
+    """Redirect user-scoped runtime data into the test temp directory.
+
+    ``CC_CODE_DIR`` is imported into many submodules with ``from cc_code.config
+    import CC_CODE_DIR``; that copies the reference at import time, so patching
+    only ``cc_code.config`` leaves the local bindings pointing at the user's
+    real home. We patch every site that owns a local binding so user-scope
+    memory, context state, and sessions all land in the sandbox.
+    """
     sandbox = tmp_path / ".cc-code"
     sandbox.mkdir(parents=True, exist_ok=True)
 
     import cc_code.config
-    import cc_code.context_manager
-    import cc_code.memory
+    import cc_code.context_manager  # package
+    import cc_code.context_manager._persistence
+    import cc_code.memory  # package
+    import cc_code.memory._manager
+    import cc_code.session
 
     monkeypatch.setattr(cc_code.config, "CC_CODE_DIR", sandbox, raising=False)
     monkeypatch.setattr(cc_code.context_manager, "CC_CODE_DIR", sandbox, raising=False)
+    monkeypatch.setattr(cc_code.context_manager._persistence, "CC_CODE_DIR", sandbox, raising=False)
     monkeypatch.setattr(cc_code.memory, "CC_CODE_DIR", sandbox, raising=False)
+    monkeypatch.setattr(cc_code.memory._manager, "CC_CODE_DIR", sandbox, raising=False)
+    monkeypatch.setattr(cc_code.session, "CC_CODE_DIR", sandbox, raising=False)
+    monkeypatch.setattr(cc_code.session, "SESSIONS_DIR", sandbox / "sessions", raising=False)
 
     return sandbox
 

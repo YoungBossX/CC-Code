@@ -98,20 +98,39 @@ def _format_command_signature(command: str, args: list[str]) -> str:
 
 # Substring patterns that flag the FULL command line as destructive, regardless
 # of how it's invoked (direct, behind cmd /c, behind bash -lc, etc.). Scanning
-# the raw string catches dangers buried in shell wrappers — e.g. `cmd /c "del /s /q *"`
-# would otherwise pass `_classify_dangerous_command("cmd", [...])` because cmd
-# itself isn't in any danger list.
+# the raw string catches dangers buried in shell wrappers — e.g.
+# ``cmd /c "del /s /q *"`` would otherwise miss because the entry-point looks
+# like the harmless ``cmd``.
+#
+# This is the single source of truth for danger classification. Both the
+# raw-string entry point (``classify_command_risk``) and the legacy argv-style
+# entry point (``_classify_dangerous_command``) scan against this same list.
+# Labels are phrased to contain the substrings legacy callers test for
+# ("catastrophic data loss", "discard local changes", "arbitrary local code"…).
 _RAW_COMMAND_DANGERS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\brm\s+-[A-Za-z]*r[A-Za-z]*f\b|\brm\s+-[A-Za-z]*f[A-Za-z]*r\b"), "rm -rf payload"),
+    # File-destruction patterns
+    (re.compile(r"\brm\s+-[A-Za-z]*r[A-Za-z]*f\b|\brm\s+-[A-Za-z]*f[A-Za-z]*r\b"), "rm -rf can cause catastrophic data loss"),
     (re.compile(r"\b(?:del|erase)\b[^|;&]*\s/(?:s|q)\b", re.IGNORECASE), "recursive Windows delete (del /s|/q)"),
     (re.compile(r"\b(?:rmdir|rd)\b[^|;&]*\s/s\b", re.IGNORECASE), "recursive Windows directory removal (rd /s)"),
+
+    # Remote-code-execution chains
     (re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sh|bash|zsh|fish)\b"), "downloads and pipes to shell"),
     (re.compile(r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|]*\|\s*(?:iex|invoke-expression)\b", re.IGNORECASE), "downloads and pipes to PowerShell Invoke-Expression"),
     (re.compile(r"\b(?:powershell|pwsh)\b[^|;&]*\b(?:iex|invoke-expression)\b", re.IGNORECASE), "PowerShell Invoke-Expression"),
-    (re.compile(r"\bgit\s+reset\s+--hard\b"), "git reset --hard discards local changes"),
+
+    # Interpreters: any invocation is "execute arbitrary local code". The label
+    # uses the legacy phrasing so test_destructive_command_classification keeps
+    # passing.
+    (re.compile(r"\b(?:node|python|python3|pythonw|bun|bash|sh|zsh|fish|powershell|pwsh)\b"), "interpreter can execute arbitrary local code"),
+
+    # Git destructive operations
+    (re.compile(r"\bgit\s+reset\s+--hard\b"), "git reset --hard can discard local changes"),
     (re.compile(r"\bgit\s+push\b[^|;&]*\s(?:--force|-f)\b"), "git push --force rewrites remote history"),
     (re.compile(r"\bgit\s+clean\b"), "git clean deletes untracked files"),
-    (re.compile(r"\bgit\s+checkout\b[^|;&]*\s--\s"), "git checkout -- overwrites working tree"),
+    (re.compile(r"\bgit\s+checkout\b[^|;&]*\s--(?:\s|$)"), "git checkout -- overwrites working tree"),
+    (re.compile(r"\bgit\s+restore\b[^|;&]*\s--source\b"), "git restore --source can overwrite local files"),
+
+    # System / disk / permissions
     (re.compile(r"\breg\s+delete\b", re.IGNORECASE), "reg delete modifies the Windows registry"),
     (re.compile(r"\bchmod\b[^|;&]*\b777\b"), "chmod 777 opens permissions to all users"),
     (re.compile(r"\b(?:dd|mkfs(?:\.[a-z0-9]+)?|fdisk|format)\b"), "disk-level operation"),
@@ -125,88 +144,55 @@ _RAW_COMMAND_DANGERS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def _match_danger(haystack: str) -> tuple[str, str] | None:
+    """Internal: return ``(label, matched_text)`` for the first matching pattern."""
+    if not haystack:
+        return None
+    for pattern, label in _RAW_COMMAND_DANGERS:
+        match = pattern.search(haystack)
+        if match:
+            return label, haystack.strip()[:200]
+    return None
+
+
 def classify_command_risk(raw_command: str, args: list[str] | None = None) -> str | None:
     """Single entry-point for command danger classification.
 
     Scans the RAW command string for known destructive patterns first — this
-    catches dangers regardless of whether the command will be invoked through a
-    shell wrapper. If the raw string is clean, falls back to argv-based
-    classification (legacy `_classify_dangerous_command`).
+    catches dangers regardless of whether the command will be invoked through
+    a shell wrapper. If the raw string is clean but argv was provided, the
+    assembled "argv[0] argv[1] ..." form is also scanned (catches cases where
+    the model invoked the tool with structured args rather than a shell string).
 
-    Returns a short reason string when the command is destructive, or None.
+    Returns ``"<label>: <command excerpt>"`` if destructive, otherwise None.
     """
-    if not raw_command:
-        return None
-    for pattern, label in _RAW_COMMAND_DANGERS:
-        if pattern.search(raw_command):
-            return f"{label}: {raw_command.strip()[:200]}"
-    if args is not None and args:
+    hit = _match_danger(raw_command)
+    if hit is None and args:
         head, *rest = args
         if isinstance(head, str):
-            return _classify_dangerous_command(head, [str(a) for a in rest])
-    return None
+            assembled = _format_command_signature(head, [str(a) for a in rest])
+            if assembled and assembled != raw_command:
+                hit = _match_danger(assembled)
+    if hit is None:
+        return None
+    label, excerpt = hit
+    return f"{label}: {excerpt}"
 
 
 def _classify_dangerous_command(command: str, args: list[str]) -> str | None:
+    """Legacy argv-form entry-point. Assembles the signature and runs the
+    same `_RAW_COMMAND_DANGERS` rules used by `classify_command_risk`, then
+    reformats the result to the legacy ``"<reason> (<signature>)"`` shape
+    that ``PermissionManager.ensure_command`` and ``test_permissions`` expect.
+    """
     normalized_args = [arg.strip() for arg in args if arg.strip()]
     signature = _format_command_signature(command, normalized_args)
 
-    if command == "git":
-        if "reset" in normalized_args and "--hard" in normalized_args:
-            return f"git reset --hard can discard local changes ({signature})"
-        if "clean" in normalized_args:
-            return f"git clean can delete untracked files ({signature})"
-        if "checkout" in normalized_args and "--" in normalized_args:
-            return f"git checkout -- can overwrite working tree files ({signature})"
-        if "push" in normalized_args and any(arg in {"--force", "-f"} for arg in normalized_args):
-            return f"git push --force rewrites remote history ({signature})"
-        if "restore" in normalized_args and any(arg.startswith("--source") for arg in normalized_args):
-            return f"git restore --source can overwrite local files ({signature})"
-
-    if command == "npm" and "publish" in normalized_args:
-        return f"npm publish affects a registry outside this machine ({signature})"
-
-    # 灾难性删除命令检测
-    if command == "rm":
-        # 组合所有标志（支持 -rf, -fr, -Rf, -r -f 等）
-        combined_flags = "".join(arg for arg in normalized_args if arg.startswith("-")).lower()
-        # 检查是否同时有递归和强制标志
-        if "r" in combined_flags and "f" in combined_flags:
-            # 检查是否针对根目录或使用 --no-preserve-root
-            if any(arg in {"/", "/*"} for arg in normalized_args) or "--no-preserve-root" in normalized_args:
-                return f"rm -rf can cause catastrophic data loss ({signature})"
-            # 即使不是根目录，rm -rf 也是危险的
-            return f"rm -rf can cause catastrophic data loss ({signature})"
-
-    # 磁盘写入/格式化命令检测
-    if command in {"dd", "mkfs", "mkfs.ext4", "mkfs.vfat", "fdisk", "format"}:
-        return f"{command} can modify or destroy disk partitions ({signature})"
-
-    # 权限全开命令检测
-    if command == "chmod":
-        if "777" in normalized_args or any(arg.endswith("777") for arg in normalized_args):
-            return f"chmod 777 opens permissions to all users ({signature})"
-
-    if command in {
-        "node", "python", "python3", "pythonw",
-        "bun", "bash", "sh", "zsh", "fish",
-        "powershell", "pwsh",
-    }:
-        return f"{command} can execute arbitrary local code ({signature})"
-
-    # macOS-specific dangerous commands
-    if command == "diskutil":
-        return f"diskutil can erase or partition disks ({signature})"
-    if command == "csrutil":
-        return f"csrutil modifies System Integrity Protection ({signature})"
-    if command == "defaults" and "write" in normalized_args:
-        return f"defaults write modifies system preferences ({signature})"
-    if command == "launchctl" and any(arg in {"unload", "bootout", "disable"} for arg in normalized_args):
-        return f"launchctl can disable system services ({signature})"
-    if command == "dscl":
-        return f"dscl can modify directory services and user accounts ({signature})"
-
-    return None
+    hit = _match_danger(signature)
+    if hit is None:
+        return None
+    label, _ = hit
+    return f"{label} ({signature})"
 
 
 def _read_permission_store() -> dict[str, Any]:

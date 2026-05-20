@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any, Callable
 from cc_code.tui.input_parser import KeyEvent, ParsedInputEvent, TextEvent, WheelEvent, parse_input_chunk
-from cc_code.tui.state import ScreenState, TtyAppArgs
+from cc_code.tui.state import AggregatedEditProgress, ScreenState, TtyAppArgs
 from cc_code.cli_commands import try_handle_local_command, find_matching_slash_commands
 from cc_code.agent_loop import run_agent_turn
 from cc_code.context_manager import save_context_state
@@ -256,13 +256,377 @@ def _execute_tool_shortcut(
 # ---------------------------------------------------------------------------
 
 
+class _AgentTurnCallbacks:
+    """Bundles the six callbacks `run_agent_turn` needs, with the per-turn
+    UI state they share.
+
+    Pulled out of `_handle_input` so the dispatcher reads as a flat
+    sequence of cases instead of a 400-line function with nested closures.
+    The dicts (``pending_tool_entries``, ``aggregated_edit_*``) and
+    ``active_stream_entry_id`` are scoped per-turn — one instance per
+    agent invocation.
+    """
+
+    def __init__(self, state: ScreenState, rerender: Callable[[], None]) -> None:
+        self.state = state
+        self.rerender = rerender
+        self.pending_tool_entries: dict[str, list[int]] = defaultdict(list)
+        self.aggregated_edit_by_key: dict[str, AggregatedEditProgress] = {}
+        self.aggregated_edit_by_entry_id: dict[int, AggregatedEditProgress] = {}
+        self.active_stream_entry_id: int | None = None
+
+    def on_assistant_stream_chunk(self, content: str) -> None:
+        if self.active_stream_entry_id is None:
+            self.active_stream_entry_id = _push_transcript_entry(
+                self.state, kind="assistant", body=content
+            )
+        else:
+            _append_to_transcript_entry(self.state, self.active_stream_entry_id, content)
+        self.state.transcript_scroll_offset = 0
+        self.rerender()
+
+    def on_assistant_message(self, content: str) -> None:
+        from cc_code.hooks import HookEvent, fire_hook_sync
+        from cc_code.auto_mode import AutoModeChecker
+        fire_hook_sync(HookEvent.ASSISTANT_OUTPUT, assistant_output=content[:500])
+        is_unsafe, unsafe_reason = AutoModeChecker.classify_output_safety(content)
+        if is_unsafe:
+            logger.warning("Potentially unsafe output detected: %s", unsafe_reason)
+
+        if self.active_stream_entry_id is not None:
+            _update_transcript_entry(self.state, self.active_stream_entry_id, body=content)
+            self.active_stream_entry_id = None
+        else:
+            _push_transcript_entry(self.state, kind="assistant", body=content)
+        self.state.transcript_scroll_offset = 0
+        self.rerender()
+
+    def on_progress_message(self, content: str) -> None:
+        if self.active_stream_entry_id is not None:
+            _update_transcript_entry(
+                self.state, self.active_stream_entry_id, kind="progress", body=content
+            )
+            self.active_stream_entry_id = None
+        else:
+            _push_transcript_entry(self.state, kind="progress", body=content)
+        self.state.transcript_scroll_offset = 0
+        self.rerender()
+
+    def on_tool_start(self, tool_name: str, tool_input: Any) -> None:
+        self.state.status = f"Running {tool_name}..."
+        self.state.active_tool = tool_name
+        self.state.tool_start_time = time.monotonic()
+
+        target_path = _extract_path_from_tool_input(tool_input)
+        can_aggregate = _is_file_edit_tool(tool_name) and target_path is not None
+
+        if can_aggregate:
+            entry_id = self._begin_aggregated_edit_entry(tool_name, tool_input, target_path)
+        else:
+            entry_id = _push_transcript_entry(
+                self.state,
+                kind="tool",
+                toolName=tool_name,
+                status="running",
+                body=_summarize_tool_input(tool_name, tool_input),
+            )
+
+        self.pending_tool_entries[tool_name].append(entry_id)
+        self.state.transcript_scroll_offset = 0
+        self.rerender()
+
+    def _begin_aggregated_edit_entry(
+        self, tool_name: str, tool_input: Any, target_path: str
+    ) -> int:
+        """Get the entry id for an aggregated edit, creating one if needed."""
+        key = f"{tool_name}:{target_path}"
+        existing = self.aggregated_edit_by_key.get(key)
+        if existing:
+            existing.total += 1
+            existing.last_output = _summarize_tool_input(tool_name, tool_input)
+            _update_tool_entry(
+                self.state,
+                existing.entry_id,
+                "error" if existing.errors > 0 else "running",
+                f"Aggregated {tool_name} for {target_path}\n"
+                f"Completed: {existing.completed}/{existing.total}",
+            )
+            return existing.entry_id
+
+        entry_id = _push_transcript_entry(
+            self.state,
+            kind="tool",
+            toolName=tool_name,
+            status="running",
+            body=_summarize_tool_input(tool_name, tool_input),
+        )
+        progress = AggregatedEditProgress(
+            entry_id=entry_id,
+            tool_name=tool_name,
+            path=target_path,
+            total=1,
+            completed=0,
+            errors=0,
+            last_output=_summarize_tool_input(tool_name, tool_input),
+        )
+        self.aggregated_edit_by_key[key] = progress
+        self.aggregated_edit_by_entry_id[entry_id] = progress
+        return entry_id
+
+    def on_tool_result(self, tool_name: str, output: str, is_error: bool) -> None:
+        pending = self.pending_tool_entries.get(tool_name, [])
+        entry_id = pending.pop(0) if pending else None
+        if entry_id is not None:
+            aggregated = self.aggregated_edit_by_entry_id.get(entry_id)
+            if aggregated and aggregated.tool_name == tool_name:
+                self._finish_aggregated_edit(entry_id, aggregated, output, is_error)
+            else:
+                self._finish_single_tool(entry_id, tool_name, output, is_error)
+
+        self.state.active_tool = None
+        remaining = sum(len(v) for v in self.pending_tool_entries.values())
+        self.state.status = f"{remaining} tool(s) still running..." if remaining > 0 else None
+        self.state.transcript_scroll_offset = 0
+        self.rerender()
+
+    def _finish_aggregated_edit(
+        self,
+        entry_id: int,
+        aggregated: AggregatedEditProgress,
+        output: str,
+        is_error: bool,
+    ) -> None:
+        aggregated.completed += 1
+        if is_error:
+            aggregated.errors += 1
+        aggregated.last_output = output
+        done = aggregated.completed >= aggregated.total
+
+        if done:
+            self.state.recent_tools.append({
+                "name": f"{aggregated.tool_name} x{aggregated.total}",
+                "status": "error" if aggregated.errors > 0 else "success",
+            })
+
+        body = (
+            "\n".join([
+                f"Aggregated {aggregated.tool_name} for {aggregated.path}",
+                f"Operations: {aggregated.total}, errors: {aggregated.errors}",
+                f"Last result: {aggregated.last_output}",
+            ])
+            if done
+            else f"Aggregated {aggregated.tool_name} for {aggregated.path}\n"
+                 f"Completed: {aggregated.completed}/{aggregated.total}"
+        )
+        status = "error" if aggregated.errors > 0 else ("success" if done else "running")
+        _update_tool_entry(self.state, entry_id, status, body)
+
+        if done:
+            _collapse_tool_entry(self.state, entry_id, _summarize_collapsed_tool_body(body))
+            self.aggregated_edit_by_entry_id.pop(entry_id, None)
+            self.aggregated_edit_by_key.pop(
+                f"{aggregated.tool_name}:{aggregated.path}", None
+            )
+
+    def _finish_single_tool(
+        self, entry_id: int, tool_name: str, output: str, is_error: bool
+    ) -> None:
+        self.state.recent_tools.append({
+            "name": tool_name,
+            "status": "error" if is_error else "success",
+        })
+
+        display_output = output
+        if is_error:
+            output_lower = output.lower()
+            suggestions: list[str] = []
+            if "not found" in output_lower or "no such file" in output_lower:
+                suggestions.append("💡 File not found. Try /ls to see available files")
+            elif "permission" in output_lower or "denied" in output_lower:
+                suggestions.append("💡 Permission denied. Check file access rights")
+            elif "syntax" in output_lower or "error" in output_lower:
+                suggestions.append("💡 Error occurred. Review the output and fix issues")
+            display_output = f"ERROR: {output}" + (
+                "\n\n" + "\n".join(suggestions) if suggestions else ""
+            )
+
+        _update_tool_entry(
+            self.state,
+            entry_id,
+            "error" if is_error else "success",
+            display_output,
+        )
+        _schedule_tool_auto_collapse(self.state, entry_id, display_output, self.rerender)
+
+
+def _start_agent_turn(
+    args: TtyAppArgs,
+    state: ScreenState,
+    rerender: Callable[[], None],
+    input_text: str,
+    memory_mgr: Any,
+) -> None:
+    """Push the user message, refresh the system prompt, and launch the
+    background agent thread. The thread captures the callbacks bundle and
+    publishes results into ``state.agent_result`` for the main loop to pick up.
+    """
+    from cc_code.hooks import HookEvent, fire_hook_sync
+    from cc_code.auto_mode import AutoModeChecker
+    from cc_code.state import set_busy
+
+    _push_transcript_entry(state, kind="user", body=input_text)
+    state.transcript_scroll_offset = 0
+    state.status = "Thinking..."
+    state.is_busy = True
+
+    fire_hook_sync(HookEvent.USER_INPUT, user_input=input_text)
+
+    is_injection, injection_reason = AutoModeChecker.detect_prompt_injection(input_text)
+    if is_injection:
+        logger.warning("Potential prompt injection detected: %s", injection_reason)
+        args.messages.append({
+            "role": "system",
+            "content": (
+                f"[SECURITY WARNING] Potential prompt injection pattern detected: "
+                f"{injection_reason}. Proceed with caution and verify all outputs."
+            ),
+        })
+
+    if state.app_state:
+        state.app_state.set_state(set_busy())
+
+    rerender()
+
+    # Refresh system prompt with current permissions / skills / memory.
+    args.messages[0] = {
+        "role": "system",
+        "content": build_system_prompt(
+            args.cwd,
+            args.permissions.get_summary(),
+            {
+                "skills": args.tools.get_skills(),
+                "mcpServers": args.tools.get_mcp_servers(),
+                "memory_context": (
+                    memory_mgr.get_relevant_context(query=input_text)
+                    if memory_mgr is not None
+                    else ""
+                ),
+            },
+        ),
+    }
+    args.messages.append({"role": "user", "content": input_text})
+
+    callbacks = _AgentTurnCallbacks(state, rerender)
+    args.permissions.begin_turn()
+
+    agent_result: dict = {"messages": None}
+    agent_thread_lock = threading.Lock()
+
+    def _run_agent_background():
+        try:
+            next_messages = run_agent_turn(
+                model=args.model,
+                tools=args.tools,
+                messages=list(args.messages),  # Copy to avoid race condition
+                cwd=args.cwd,
+                permissions=args.permissions,
+                on_tool_start=callbacks.on_tool_start,
+                on_tool_result=callbacks.on_tool_result,
+                on_assistant_message=callbacks.on_assistant_message,
+                on_progress_message=callbacks.on_progress_message,
+                on_assistant_stream_chunk=callbacks.on_assistant_stream_chunk,
+                store=state.app_state,
+                context_manager=args.context_manager,
+                runtime=args.runtime,
+            )
+            if args.context_manager is not None:
+                args.context_manager.messages = next_messages
+                save_context_state(args.context_manager)
+            with agent_thread_lock:
+                agent_result["messages"] = next_messages
+        except Exception:
+            logger.exception("Agent turn crashed")
+        finally:
+            args.permissions.end_turn()
+            with agent_thread_lock:
+                agent_result["done"] = True
+            state.is_busy = False
+            state.active_tool = None
+            state.status = None
+            rerender()
+
+    agent_thread = threading.Thread(target=_run_agent_background, daemon=True)
+    agent_thread.start()
+    state.agent_thread = agent_thread
+    # Assign lock BEFORE result — the main loop checks agent_result first,
+    # so the lock must already be available to avoid AttributeError.
+    state.agent_lock = agent_thread_lock
+    state.agent_result = agent_result
+
+
+def _try_history_replay(
+    args: TtyAppArgs,
+    state: ScreenState,
+    rerender: Callable[[], None],
+    input_text: str,
+) -> bool | None:
+    """``/history N`` — replay history entry N. Returns the recursive call's
+    result if dispatched, ``None`` if not applicable (caller should keep going).
+    """
+    if not input_text.startswith("/history "):
+        return None
+    suffix = input_text[len("/history "):].strip()
+    if not suffix.isdigit():
+        return None
+    history_entries = load_history_entries()
+    idx = int(suffix) - 1
+    if not (0 <= idx < len(history_entries)):
+        return None
+    return _handle_input(args, state, rerender, submitted_raw_input=history_entries[idx])
+
+
+def _try_history_picker(
+    args: TtyAppArgs,
+    state: ScreenState,
+    rerender: Callable[[], None],
+    input_text: str,
+) -> bool | None:
+    """If the history picker is open, treat a digit as a selection and any
+    other input as "cancel picker". ``None`` = picker wasn't open."""
+    if not state.history_picker_entries:
+        return None
+
+    if input_text.isdigit():
+        idx = int(input_text) - 1
+        if 0 <= idx < len(state.history_picker_entries):
+            chosen = state.history_picker_entries[idx]
+            state.history_picker_entries = []
+            state.history_picker_index = 0
+            state.input = ""
+            state.cursor_offset = 0
+            state.selected_slash_index = 0
+            state.status = f"Running history #{idx + 1}"
+            rerender()
+            return _handle_input(args, state, rerender, submitted_raw_input=chosen)
+
+    state.history_picker_entries = []
+    state.history_picker_index = 0
+    state.status = "History picker cleared"
+    rerender()
+    return False
+
+
 def _handle_input(
     args: TtyAppArgs,
     state: ScreenState,
     rerender: Callable[[], None],
     submitted_raw_input: str | None = None,
 ) -> bool:
-    """Returns True if /exit was typed."""
+    """Returns True if /exit was typed.
+
+    Linear dispatcher: each case is either handled (returning False/True) or
+    falls through to the agent turn at the bottom.
+    """
     if state.is_busy:
         state.status = (
             f"Running {state.active_tool}..."
@@ -277,39 +641,18 @@ def _handle_input(
     if input_text == "/exit":
         return True
 
-    if input_text.startswith("/history "):
-        suffix = input_text[len("/history "):].strip()
-        if suffix.isdigit():
-            history_entries = load_history_entries()
-            selected_index = int(suffix) - 1
-            if 0 <= selected_index < len(history_entries):
-                return _handle_input(
-                    args,
-                    state,
-                    rerender,
-                    submitted_raw_input=history_entries[selected_index],
-                )
+    # /history N — replay a numbered history entry (if N is valid; otherwise
+    # we keep going so plain `/history` and the picker logic still work).
+    history_result = _try_history_replay(args, state, rerender, input_text)
+    if history_result is not None:
+        return history_result
 
-    if state.history_picker_entries:
-        if input_text.isdigit():
-            choice_index = int(input_text) - 1
-            if 0 <= choice_index < len(state.history_picker_entries):
-                chosen = state.history_picker_entries[choice_index]
-                state.history_picker_entries = []
-                state.history_picker_index = 0
-                state.input = ""
-                state.cursor_offset = 0
-                state.selected_slash_index = 0
-                state.status = f"Running history #{choice_index + 1}"
-                rerender()
-                return _handle_input(args, state, rerender, submitted_raw_input=chosen)
+    # History picker open: digit selects, anything else cancels.
+    picker_result = _try_history_picker(args, state, rerender, input_text)
+    if picker_result is not None:
+        return picker_result
 
-        state.history_picker_entries = []
-        state.history_picker_index = 0
-        state.status = "History picker cleared"
-        rerender()
-        return False
-
+    # `# <memory>` or `/memory add ...`
     memory_mgr = getattr(args, "memory_manager", None)
     if memory_mgr is not None:
         memory_result = memory_mgr.handle_user_memory_input(input_text)
@@ -318,43 +661,41 @@ def _handle_input(
             _push_transcript_entry(state, kind="assistant", body=memory_result)
             return False
 
-    # History
+    # Save to history (avoid consecutive duplicates).
     if not state.history or state.history[-1] != input_text:
         state.history.append(input_text)
         save_history_entries(state.history)
     state.history_index = len(state.history)
     state.history_draft = ""
 
-    # Autosave trigger
     if state.autosave:
         state.autosave.mark_dirty()
 
-    # /tools
+    # /tools — list all registered tools.
     if input_text == "/tools":
         _push_transcript_entry(
             state,
             kind="assistant",
-            body="\n".join(
-                f"{t.name}: {t.description}" for t in args.tools.list()
-            ),
+            body="\n".join(f"{t.name}: {t.description}" for t in args.tools.list()),
         )
         return False
 
-    # Local commands
+    # Built-in local commands (/help, /status, /history with no arg, etc).
     local_result = try_handle_local_command(input_text, tools=args.tools, cwd=args.cwd)
     if local_result is not None:
         _push_transcript_entry(state, kind="assistant", body=local_result)
         if input_text == "/history":
             state.history_picker_entries = load_history_entries()
             state.history_picker_index = 0
-            if state.history_picker_entries:
-                state.status = "History picker: type a number and press Enter; Esc cancels"
-            else:
-                state.status = "No prompt history found"
+            state.status = (
+                "History picker: type a number and press Enter; Esc cancels"
+                if state.history_picker_entries
+                else "No prompt history found"
+            )
             rerender()
         return False
 
-    # Tool shortcuts
+    # Direct tool shortcut (eg. `!ls`, `?grep ...`).
     shortcut = parse_local_tool_shortcut(input_text)
     if shortcut:
         _execute_tool_shortcut(
@@ -362,7 +703,7 @@ def _handle_input(
         )
         return False
 
-    # Unknown slash commands
+    # Unknown /slash → suggest similar.
     if input_text.startswith("/"):
         matches = find_matching_slash_commands(input_text)
         _push_transcript_entry(
@@ -376,281 +717,8 @@ def _handle_input(
         )
         return False
 
-    # Agent turn
-    _push_transcript_entry(state, kind="user", body=input_text)
-    state.transcript_scroll_offset = 0
-    state.status = "Thinking..."
-    state.is_busy = True
-    
-    # Hook: user input
-    from cc_code.hooks import HookEvent, fire_hook_sync
-    fire_hook_sync(HookEvent.USER_INPUT, user_input=input_text)
-    
-    # Prompt injection detection (input layer)
-    from cc_code.auto_mode import AutoModeChecker
-    is_injection, injection_reason = AutoModeChecker.detect_prompt_injection(input_text)
-    if is_injection:
-        logger.warning("Potential prompt injection detected: %s", injection_reason)
-        # Don't block, but add a system message warning
-        args.messages.append({
-            "role": "system",
-            "content": f"[SECURITY WARNING] Potential prompt injection pattern detected: {injection_reason}. Proceed with caution and verify all outputs."
-        })
-    
-    # Update app state
-    if state.app_state:
-        from cc_code.state import set_busy
-        state.app_state.set_state(set_busy())
-    
-    rerender()
-
-    pending_tool_entries: dict[str, list[int]] = defaultdict(list)
-    aggregated_edit_by_key: dict[str, AggregatedEditProgress] = {}
-    aggregated_edit_by_entry_id: dict[int, AggregatedEditProgress] = {}
-
-    # Refresh system prompt
-    args.messages[0] = {
-        "role": "system",
-        "content": build_system_prompt(
-            args.cwd,
-            args.permissions.get_summary(),
-            {
-                "skills": args.tools.get_skills(),
-                "mcpServers": args.tools.get_mcp_servers(),
-                "memory_context": memory_mgr.get_relevant_context(query=input_text) if memory_mgr is not None else "",
-            },
-        ),
-    }
-    args.messages.append({"role": "user", "content": input_text})
-
-    active_stream_entry_id = None
-
-    def on_assistant_stream_chunk(content: str) -> None:
-        nonlocal active_stream_entry_id
-        if active_stream_entry_id is None:
-            active_stream_entry_id = _push_transcript_entry(state, kind="assistant", body=content)
-        else:
-            _append_to_transcript_entry(state, active_stream_entry_id, content)
-        state.transcript_scroll_offset = 0
-        rerender()
-
-    def on_assistant_message(content: str) -> None:
-        nonlocal active_stream_entry_id
-        # Hook: assistant output
-        fire_hook_sync(HookEvent.ASSISTANT_OUTPUT, assistant_output=content[:500])
-        # Output safety check (output layer)
-        from cc_code.auto_mode import AutoModeChecker
-        is_unsafe, unsafe_reason = AutoModeChecker.classify_output_safety(content)
-        if is_unsafe:
-            logger.warning("Potentially unsafe output detected: %s", unsafe_reason)
-        if active_stream_entry_id is not None:
-            _update_transcript_entry(state, active_stream_entry_id, body=content)
-            active_stream_entry_id = None
-        else:
-            _push_transcript_entry(state, kind="assistant", body=content)
-        state.transcript_scroll_offset = 0
-        rerender()
-
-    def on_progress_message(content: str) -> None:
-        nonlocal active_stream_entry_id
-        if active_stream_entry_id is not None:
-            _update_transcript_entry(state, active_stream_entry_id, kind="progress", body=content)
-            active_stream_entry_id = None
-        else:
-            _push_transcript_entry(state, kind="progress", body=content)
-        state.transcript_scroll_offset = 0
-        rerender()
-
-    def on_tool_start(tool_name: str, tool_input: Any) -> None:
-        state.status = f"Running {tool_name}..."
-        state.active_tool = tool_name
-        state.tool_start_time = time.monotonic()  # 记录工具启动时间
-
-        target_path = _extract_path_from_tool_input(tool_input)
-        can_aggregate = _is_file_edit_tool(tool_name) and target_path is not None
-
-        if can_aggregate:
-            key = f"{tool_name}:{target_path}"
-            existing = aggregated_edit_by_key.get(key)
-            if existing:
-                existing.total += 1
-                existing.last_output = _summarize_tool_input(tool_name, tool_input)
-                entry_id = existing.entry_id
-                _update_tool_entry(
-                    state,
-                    entry_id,
-                    "error" if existing.errors > 0 else "running",
-                    f"Aggregated {tool_name} for {target_path}\nCompleted: {existing.completed}/{existing.total}",
-                )
-            else:
-                entry_id = _push_transcript_entry(
-                    state,
-                    kind="tool",
-                    toolName=tool_name,
-                    status="running",
-                    body=_summarize_tool_input(tool_name, tool_input),
-                )
-                progress = AggregatedEditProgress(
-                    entry_id=entry_id,
-                    tool_name=tool_name,
-                    path=target_path,
-                    total=1,
-                    completed=0,
-                    errors=0,
-                    last_output=_summarize_tool_input(tool_name, tool_input),
-                )
-                aggregated_edit_by_key[key] = progress
-                aggregated_edit_by_entry_id[entry_id] = progress
-        else:
-            entry_id = _push_transcript_entry(
-                state,
-                kind="tool",
-                toolName=tool_name,
-                status="running",
-                body=_summarize_tool_input(tool_name, tool_input),
-            )
-
-        pending_tool_entries[tool_name].append(entry_id)
-        state.transcript_scroll_offset = 0
-        rerender()
-
-    def on_tool_result(tool_name: str, output: str, is_error: bool) -> None:
-        # 计算并显示工具执行时间
-        elapsed = ""
-        if state.tool_start_time is not None:
-            elapsed_secs = time.monotonic() - state.tool_start_time
-            if elapsed_secs > 1:
-                elapsed = f" ({elapsed_secs:.1f}s)"
-        
-        pending = pending_tool_entries.get(tool_name, [])
-        entry_id = pending.pop(0) if pending else None
-        if entry_id is not None:
-            aggregated = aggregated_edit_by_entry_id.get(entry_id)
-            if aggregated and aggregated.tool_name == tool_name:
-                aggregated.completed += 1
-                if is_error:
-                    aggregated.errors += 1
-                aggregated.last_output = output
-                done = aggregated.completed >= aggregated.total
-                if done:
-                    state.recent_tools.append({
-                        "name": f"{tool_name} x{aggregated.total}",
-                        "status": "error" if aggregated.errors > 0 else "success",
-                    })
-                body = (
-                    "\n".join([
-                        f"Aggregated {tool_name} for {aggregated.path}",
-                        f"Operations: {aggregated.total}, errors: {aggregated.errors}",
-                        f"Last result: {aggregated.last_output}",
-                    ])
-                    if done
-                    else f"Aggregated {tool_name} for {aggregated.path}\nCompleted: {aggregated.completed}/{aggregated.total}"
-                )
-                _update_tool_entry(
-                    state,
-                    entry_id,
-                    "error" if aggregated.errors > 0 else ("success" if done else "running"),
-                    body,
-                )
-                if done:
-                    _collapse_tool_entry(state, entry_id, _summarize_collapsed_tool_body(body))
-                    aggregated_edit_by_entry_id.pop(entry_id, None)
-                    aggregated_edit_by_key.pop(f"{tool_name}:{aggregated.path}", None)
-            else:
-                state.recent_tools.append({
-                    "name": tool_name,
-                    "status": "error" if is_error else "success",
-                })
-                
-                # 错误恢复引导
-                display_output = output
-                if is_error:
-                    suggestions = []
-                    output_lower = output.lower()
-                    if "not found" in output_lower or "no such file" in output_lower:
-                        suggestions.append("💡 File not found. Try /ls to see available files")
-                    elif "permission" in output_lower or "denied" in output_lower:
-                        suggestions.append("💡 Permission denied. Check file access rights")
-                    elif "syntax" in output_lower or "error" in output_lower:
-                        suggestions.append("💡 Error occurred. Review the output and fix issues")
-                    
-                    if suggestions:
-                        display_output = f"ERROR: {output}\n\n" + "\n".join(suggestions)
-                    else:
-                        display_output = f"ERROR: {output}"
-                
-                _update_tool_entry(
-                    state,
-                    entry_id,
-                    "error" if is_error else "success",
-                    display_output,
-                )
-                _schedule_tool_auto_collapse(
-                    state,
-                    entry_id,
-                    display_output,
-                    rerender,
-                )
-
-        state.active_tool = None
-        remaining = sum(len(v) for v in pending_tool_entries.values())
-        if remaining > 0:
-            state.status = f"{remaining} tool(s) still running..."
-        else:
-            state.status = None
-        state.transcript_scroll_offset = 0
-        rerender()
-
-    args.permissions.begin_turn()
-    
-    # Run agent turn in background thread to keep UI responsive
-    agent_error = None
-    agent_result: dict = {"messages": None}
-    agent_thread_lock = threading.Lock()
-    
-    def _run_agent_background():
-        nonlocal agent_error, agent_result
-        try:
-            next_messages = run_agent_turn(
-                model=args.model,
-                tools=args.tools,
-                messages=list(args.messages),  # Copy to avoid race condition
-                cwd=args.cwd,
-                permissions=args.permissions,
-                on_tool_start=on_tool_start,
-                on_tool_result=on_tool_result,
-                on_assistant_message=on_assistant_message,
-                on_progress_message=on_progress_message,
-                on_assistant_stream_chunk=on_assistant_stream_chunk,
-                store=state.app_state,
-                context_manager=args.context_manager,
-                runtime=args.runtime,
-            )
-            if args.context_manager is not None:
-                args.context_manager.messages = next_messages
-                save_context_state(args.context_manager)
-            with agent_thread_lock:
-                agent_result["messages"] = next_messages
-        except Exception as e:
-            agent_error = e
-        finally:
-            args.permissions.end_turn()
-            with agent_thread_lock:
-                agent_result["done"] = True
-            state.is_busy = False
-            state.active_tool = None
-            state.status = None
-            rerender()
-    
-    agent_thread = threading.Thread(target=_run_agent_background, daemon=True)
-    agent_thread.start()
-    state.agent_thread = agent_thread
-    # Assign lock BEFORE result — the main loop checks agent_result first,
-    # so the lock must already be available to avoid AttributeError.
-    state.agent_lock = agent_thread_lock
-    state.agent_result = agent_result
-    
-    # Return immediately - agent runs in background
+    # Fall through: real agent turn.
+    _start_agent_turn(args, state, rerender, input_text, memory_mgr)
     return False
 
 

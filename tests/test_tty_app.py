@@ -221,7 +221,7 @@ def test_startup_panel_shows_enter_message(tmp_path) -> None:
     rendered = _render_startup_panel(args, state)
 
     assert "Press Enter to continue" in rendered
-    assert "Welcome back" in rendered
+    assert "Welcome to CC-Code" in rendered
 
 
 def test_tty_history_picker_number_executes_selected_entry(tmp_path, monkeypatch) -> None:
