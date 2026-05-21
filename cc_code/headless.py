@@ -85,6 +85,7 @@ def run_headless(prompt: str | None = None) -> str:
                     "skills": tools.get_skills(),
                     "mcpServers": tools.get_mcp_servers(),
                     "memory_context": memory_mgr.get_relevant_context(),
+                    "model": runtime.get("model", "mock"),
                 },
             ),
         },

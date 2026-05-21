@@ -511,6 +511,7 @@ def _start_agent_turn(
                     if memory_mgr is not None
                     else ""
                 ),
+                "model": (args.runtime or {}).get("model", "mock"),
             },
         ),
     }

@@ -43,3 +43,20 @@ def test_build_system_prompt_includes_memory_context(tmp_path: Path) -> None:
 
     assert "Project Memory & Context" in prompt
     assert "Always run pytest before release." in prompt
+
+
+def test_build_system_prompt_injects_model_identity(tmp_path: Path) -> None:
+    prompt = build_system_prompt(
+        str(tmp_path),
+        [],
+        {"model": "claude-opus-4-7"},
+    )
+
+    assert "claude-opus-4-7" in prompt
+    assert "Identity" in prompt
+    assert "Do not call run_command" in prompt
+
+
+def test_build_system_prompt_skips_identity_when_model_absent(tmp_path: Path) -> None:
+    prompt = build_system_prompt(str(tmp_path), [], {})
+    assert "## Identity" not in prompt

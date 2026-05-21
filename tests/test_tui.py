@@ -68,6 +68,29 @@ def test_render_transcript_shows_collapsed_summary_when_fully_collapsed() -> Non
     assert "full output here" not in rendered
 
 
+def test_render_transcript_shows_above_fold_indicator_when_content_overflows() -> None:
+    # Body with many lines forces total_lines > window_size.
+    long_body = "\n".join(f"line {i}" for i in range(60))
+    transcript = [TranscriptEntry(id=1, kind="assistant", body=long_body)]
+
+    rendered = render_transcript(transcript, scroll_offset=0, window_size=10)
+
+    # Top indicator must appear so the user knows there's content above.
+    assert "上方还有" in rendered
+    assert "PgUp" in rendered
+    # Tail of the body should still be the last visible line.
+    assert "line 59" in rendered
+    # Beginning of the body must be hidden (proves the window is clipping).
+    assert "line 0" not in rendered
+
+
+def test_render_transcript_no_indicator_when_content_fits() -> None:
+    transcript = [TranscriptEntry(id=1, kind="user", body="hi")]
+    rendered = render_transcript(transcript, scroll_offset=0, window_size=10)
+    assert "上方还有" not in rendered
+    assert "hi" in rendered
+
+
 def test_render_permission_prompt_lists_choices() -> None:
     rendered = render_permission_prompt(
         {

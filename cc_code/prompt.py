@@ -146,6 +146,20 @@ def build_system_prompt(
     )
 
     # --- Dynamic Suffix (Per-turn) ---
+    # Model identity — short-circuits "what model are you?" so the model
+    # answers directly instead of invoking run_command to read env vars.
+    model_id = str(extras.get("model") or "").strip()
+    if model_id:
+        identity_text = (
+            "## Identity\n"
+            f"You are running on model `{model_id}`.\n"
+            "When the user asks which model you are (or any equivalent identity "
+            "question), answer directly with this id. Do not call run_command, "
+            "read environment variables, or use any tool to look up your model — "
+            "the answer is already provided here."
+        )
+        pipeline.register_dynamic("identity", lambda: identity_text)
+
     # Permission context
     if permission_summary:
         perm_text = "Permission context:\n" + "\n".join(permission_summary)

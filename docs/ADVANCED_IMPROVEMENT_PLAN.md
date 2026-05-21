@@ -6,6 +6,23 @@ Make CC-Coder feel closer to Claude Code in sustained coding sessions: reliable 
 
 This plan is based on a local architecture review of the current branch. The `dual-codex-review` MCP was attempted first but returned `Transport closed`; rerun this plan through dual review when that MCP is healthy.
 
+> **May 2026 update — read before acting on the file references below.**
+> Four modules that this plan refers to by single-file paths are now packages:
+>
+> | Plan references | Actual location now |
+> |---|---|
+> | `cc_code/memory.py` | `cc_code/memory/` (package: `_search`, `_classify`, `_types`, `_validation`, `_manager`, `_commands`) |
+> | `cc_code/context_manager.py` | `cc_code/context_manager/` (package: `_tokens`, `_summary`, `_manager`, `_persistence`) |
+> | `cc_code/mcp.py` | `cc_code/mcp/` (package: `_types`, `_helpers`, `_client`, `_registry`) |
+> | `cc_code/tui/chrome.py` | `cc_code/tui/chrome/` (package: `_ansi`, `_terminal`, `_width`, `_panels`, `_components`, `_diff`, `_permission`) |
+>
+> External imports unchanged (e.g. `from cc_code.memory import MemoryManager` still works). When a plan step says "modify cc_code/mcp.py", treat it as "modify the relevant submodule in `cc_code/mcp/`".
+>
+> Also new since this plan was drafted:
+> - `cc_code/io_atomic.py` provides `atomic_write_text(path, content)` — use it for any new persistent state instead of rolling another temp-file dance.
+> - `cc_code.session` now writes append-only JSONL (`{id}.jsonl`), not full-JSON + deltas. Legacy `{id}.json` + `deltas/` files remain readable by `load_session` for migration.
+> - `cc_code.state.Store` now properly fires listeners (was a no-op before due to in-place mutation defeating the change detector — fixed by switching updaters to `dataclasses.replace`).
+
 ## Current Baseline
 
 - Core agent loop exists with multi-step tool use, recoverable empty/thinking response handling, concurrent read-only tool execution, and callback hooks.

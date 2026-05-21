@@ -340,10 +340,21 @@ def render_transcript(
     offset = max(0, min(scroll_offset, max_offset))
 
     if offset == 0:
+        if max_offset == 0:
+            visible_lines = _render_visible_window(entries, 0, total_lines, revision)
+            return "\n".join(visible_lines)
+        # Content overflows the window: reserve one line for an above-fold
+        # indicator so the reader knows there's more above and can PgUp.
+        content_ws = max(1, ws - 1)
         end = total_lines
-        start = max(0, end - ws)
+        start = max(0, end - content_ws)
         visible_lines = _render_visible_window(entries, start, end, revision)
-        return "\n".join(visible_lines)
+        body = "\n".join(visible_lines)
+        return (
+            f"{t.subtle}  {ICON_DIVIDER * 2} 上方还有 {max_offset} 行 "
+            f"(PgUp/PgDn 滚动){ICON_DIVIDER * 2}{t.reset}\n"
+            f"{body}"
+        )
 
     content_ws = max(1, ws - 1)
     end = total_lines - offset
