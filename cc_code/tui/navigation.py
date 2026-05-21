@@ -19,6 +19,10 @@ _TRANSCRIPT_FRAME_LINES = 4
 def _get_transcript_body_lines(args: TtyAppArgs, state: ScreenState) -> int:
     _, rows = _cached_terminal_size()
     rows = max(24, rows)
+    if state.last_chrome_lines is not None:
+        # Renderer measured the actual chrome on the previous frame —
+        # use it so the transcript fills the real remaining height.
+        return max(6, rows - state.last_chrome_lines - _TRANSCRIPT_FRAME_LINES)
     chrome_overhead = (
         _HEADER_LINES_ESTIMATE
         + _PROMPT_LINES_ESTIMATE

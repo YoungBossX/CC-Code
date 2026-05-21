@@ -222,7 +222,8 @@ def _render_screen(args: TtyAppArgs, state: ScreenState) -> None:
     buf.append("\u001b[2J\u001b[H")
 
     # Header
-    buf.append(_render_header_panel(args, state))
+    header_str = _render_header_panel(args, state)
+    buf.append(header_str)
     buf.append("\n\n")
 
     has_skills = len(args.tools.get_skills()) > 0
@@ -255,6 +256,24 @@ def _render_screen(args: TtyAppArgs, state: ScreenState) -> None:
         _last_render_time = now
         return
 
+    # Render the surrounding chrome first so we can measure its real
+    # line count and give the transcript every remaining row in the
+    # terminal — instead of relying on a fixed estimate that always
+    # under-shoots and crops long replies.
+    prompt_str = _render_prompt_panel(state)
+    footer_str = _render_footer_cached(state.status, True, has_skills, background_tasks)
+
+    # Three "\n\n" gaps in the layout (after header, after transcript,
+    # after prompt). Each one renders as a blank line between panels.
+    _GAP_LINES = 3
+    actual_chrome_lines = (
+        header_str.count("\n") + 1
+        + prompt_str.count("\n") + 1
+        + footer_str.count("\n") + 1
+        + _GAP_LINES
+    )
+    state.last_chrome_lines = actual_chrome_lines
+
     # Transcript — snapshot the list to avoid IndexError from concurrent
     # agent-thread appends (CPython GIL makes list.append atomic but
     # iteration + append can still race on length vs slot access).
@@ -279,12 +298,10 @@ def _render_screen(args: TtyAppArgs, state: ScreenState) -> None:
     )
     buf.append("\n\n")
 
-    # Prompt
-    buf.append(_render_prompt_panel(state))
+    # Prompt + footer were already rendered above for measurement; reuse.
+    buf.append(prompt_str)
     buf.append("\n\n")
-
-    # Footer (cached)
-    buf.append(_render_footer_cached(state.status, True, has_skills, background_tasks))
+    buf.append(footer_str)
     
     # 上下文帮助行
     if contextual_help:

@@ -1,3 +1,4 @@
+from cc_code.tui.navigation import _get_transcript_body_lines
 from cc_code.tui.state import ScreenState
 from cc_code.tui.tool_lifecycle import (
     _append_to_transcript_entry,
@@ -8,6 +9,8 @@ from cc_code.tui.tool_lifecycle import (
 )
 from cc_code.tui.transcript import render_transcript
 import cc_code.tui.transcript as transcript_module
+import cc_code.tui.chrome as chrome_module
+import cc_code.tui.navigation as navigation_module
 from cc_code.tui.types import TranscriptEntry
 
 
@@ -98,3 +101,24 @@ def test_entry_cache_uses_full_render_state_key() -> None:
 
     assert "second body" in rendered
     assert "first body" not in rendered
+
+
+def test_get_transcript_body_lines_prefers_measured_chrome(monkeypatch) -> None:
+    # Pin a known terminal height so the math is deterministic. navigation
+    # uses `from cc_code.tui.chrome import _cached_terminal_size`, so the
+    # symbol must be patched on the navigation module's own binding.
+    monkeypatch.setattr(navigation_module, "_cached_terminal_size", lambda: (120, 40))
+
+    state = ScreenState()
+
+    # With no measurement yet, the legacy estimate (chrome overhead = 26)
+    # applies → 40 - 26 = 14.
+    fallback = _get_transcript_body_lines(args=None, state=state)
+    assert fallback == 14
+
+    # Renderer wrote a tighter, measured chrome → transcript gets more room.
+    # 40 - 18 - 4 (transcript frame) = 18.
+    state.last_chrome_lines = 18
+    measured = _get_transcript_body_lines(args=None, state=state)
+    assert measured == 18
+    assert measured > fallback

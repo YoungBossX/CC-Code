@@ -74,3 +74,8 @@ class ScreenState:
     agent_result: dict | None = None
     agent_lock: Any = None
     tool_start_time: float | None = None
+    # Updated by renderer each frame: actual lines occupied by chrome
+    # (header + prompt + footer + inter-panel gaps), excluding the transcript
+    # panel itself. Lets navigation/scroll paths compute the correct visible
+    # window size without re-running the chrome estimates.
+    last_chrome_lines: int | None = None
