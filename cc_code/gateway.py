@@ -7,15 +7,24 @@ small headless execution endpoint for platform bridges to build on.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+# /run 请求体上限，防止超大 body 耗尽内存
+MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
 
 def _json_bytes(payload: dict[str, Any], status: int = 200) -> tuple[int, bytes]:
     return status, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _expected_token() -> str:
+    """读取网关共享密钥；未配置返回空串（表示禁用 /run）。"""
+    return os.environ.get("CC_CODE_GATEWAY_TOKEN", "").strip()
 
 
 class CcCoderGatewayHandler(BaseHTTPRequestHandler):
@@ -33,6 +42,18 @@ class CcCoderGatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self) -> bool:
+        """校验 Authorization: Bearer <token> 是否匹配共享密钥。"""
+        expected = _expected_token()
+        if not expected:
+            return False
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        presented = header[len(prefix):].strip()
+        return hmac.compare_digest(presented, expected)
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path in {"/", "/health"}:
             self._send_json({"ok": True, "service": "cc-coder-gateway"})
@@ -44,8 +65,30 @@ class CcCoderGatewayHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "not found"}, status=404)
             return
 
+        if not _expected_token():
+            self._send_json(
+                {"ok": False, "error": "gateway auth not configured: set CC_CODE_GATEWAY_TOKEN"},
+                status=503,
+            )
+            return
+
+        if not self._authorized():
+            self._send_json({"ok": False, "error": "unauthorized"}, status=401)
+            return
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json({"ok": False, "error": "invalid Content-Length"}, status=400)
+            return
+        if length > MAX_BODY_BYTES:
+            self._send_json(
+                {"ok": False, "error": f"request body too large (>{MAX_BODY_BYTES} bytes)"},
+                status=413,
+            )
+            return
+
+        try:
             raw = self.rfile.read(length).decode("utf-8")
             data = json.loads(raw) if raw.strip() else {}
             prompt = str(data.get("prompt", "")).strip()
@@ -70,6 +113,13 @@ def run_gateway() -> None:
     port = int(os.environ.get("CC_CODE_GATEWAY_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), CcCoderGatewayHandler)
     print(f"CC-Coder gateway listening on http://{host}:{port}", flush=True)
+    if not _expected_token():
+        print(
+            "WARNING: CC_CODE_GATEWAY_TOKEN not set — /run is disabled (returns 503). "
+            "Set it to enable authenticated execution.",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

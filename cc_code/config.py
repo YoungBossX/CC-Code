@@ -18,15 +18,42 @@ CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 # 凭证类环境变量 — 不应传递给子进程
 _CREDENTIAL_ENV_VARS: set[str] = {
+    # LLM providers
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CUSTOM_API_KEY",
+    # Chat platform bots
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET",
+    # Cloud providers
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "GCP_API_KEY",
+    # VCS / CI / package registries
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN",
+    "GITLAB_TOKEN", "NPM_TOKEN", "PYPI_TOKEN", "HF_TOKEN",
+    # Claude Code itself
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    # CC-Coder gateway shared secret
+    "CC_CODE_GATEWAY_TOKEN",
 }
+
+# 兜底：名字本身就表明是凭证的环境变量也一并清除。
+# MCP 服务器若需要凭证，应在 mcp.json 的 env 中显式提供（_client.py 会叠加），
+# 不依赖环境继承，因此此处可以放心激进清洗。
+_CREDENTIAL_NAME_PATTERN = re.compile(
+    r"(_API_KEY|_APIKEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|"
+    r"_ACCESS_KEY|_PRIVATE_KEY|_CREDENTIALS)$",
+    re.IGNORECASE,
+)
+
+
+def _is_credential_var(name: str) -> bool:
+    return name in _CREDENTIAL_ENV_VARS or bool(_CREDENTIAL_NAME_PATTERN.search(name))
 
 
 def sanitize_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     """返回去除凭证变量后的环境变量副本，用于子进程。"""
     env = (env if env is not None else os.environ).copy()
-    for key in _CREDENTIAL_ENV_VARS:
+    for key in [k for k in env if _is_credential_var(k)]:
         env.pop(key, None)
     return env
 
@@ -336,16 +363,9 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
     """
     errors: list[str] = []
     warnings: list[str] = []
-    
-    success_runtime = False
-    success_runtime = False
-    # track whether we successfully loaded the full runtime config
-    success_runtime = False
+
     try:
         config = load_runtime_config(cwd)
-        success_runtime = True
-        success_runtime = True
-        success_runtime = True
         errors.extend(validate_provider_runtime(config))
         
         # 检查模型名称拼写
@@ -408,33 +428,10 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
 
 
 def format_config_diagnostic(cwd: str | Path | None = None) -> str:
-    """格式化配置诊断信息"""
-    is_valid, messages = validate_config(cwd)
-    
-    lines = ["Configuration Diagnostics", "=" * 40, ""]
-    
-    if is_valid:
-        lines.append("Status: OK")
-        if messages:
-            lines.append("")
-            lines.append("Warnings:")
-            for msg in messages:
-                lines.append(f"  [WARN] {msg}")
-    else:
-        lines.append("Status: ERRORS")
-        lines.append("")
-        lines.append("Errors:")
-        for msg in messages:
-            lines.append(f"  [ERROR] {msg}")
-    
-    # 显示当前配置摘要（无论是否有效，都尽量显示 Tool Profile）
-    """
-    Build a diagnostic string showing configuration validity and a concise
-    summary of the current runtime (including a Tool Profile). This function
-    always attempts to include a `Tool Profile:` line even when loading the
-    full runtime config fails.
-    """
+    """格式化配置诊断信息。
 
+    始终尽量输出 `Tool Profile:` 一行，即便加载完整运行时配置失败。
+    """
     is_valid, messages = validate_config(cwd)
 
     lines = ["Configuration Diagnostics", "=" * 40, ""]

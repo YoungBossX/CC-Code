@@ -53,6 +53,7 @@ def test_ci_workflow_runs_release_quality_gates() -> None:
     assert "python -m compileall -q cc_code tests" in content
     assert "python -m pytest -q" in content
     assert "tests/test_packaging.py" in content
+    assert "python -m build" in content
 
 
 def test_cron_runner_empty_config_exits_cleanly(tmp_path: Path) -> None:
@@ -101,11 +102,19 @@ def test_gateway_health_endpoint_responds() -> None:
         thread.join(timeout=5)
 
 
-def _post_gateway_json(port: int, payload: dict) -> tuple[int, dict]:
+_GATEWAY_TEST_TOKEN = "test-gateway-secret"
+
+
+def _post_gateway_json(
+    port: int, payload: dict, token: str | None = _GATEWAY_TEST_TOKEN
+) -> tuple[int, dict]:
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/run",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -121,6 +130,7 @@ def test_gateway_run_endpoint_returns_headless_response(monkeypatch) -> None:
     import cc_code.headless
     from cc_code.gateway import CcCoderGatewayHandler
 
+    monkeypatch.setenv("CC_CODE_GATEWAY_TOKEN", _GATEWAY_TEST_TOKEN)
     monkeypatch.setattr(cc_code.headless, "run_headless", lambda prompt: f"mock:{prompt}")
     server = ThreadingHTTPServer(("127.0.0.1", 0), CcCoderGatewayHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -144,6 +154,7 @@ def test_gateway_run_endpoint_converts_system_exit_to_json_error(monkeypatch) ->
     def fail_headless(_prompt: str) -> str:
         raise SystemExit("missing config")
 
+    monkeypatch.setenv("CC_CODE_GATEWAY_TOKEN", _GATEWAY_TEST_TOKEN)
     monkeypatch.setattr(cc_code.headless, "run_headless", fail_headless)
     server = ThreadingHTTPServer(("127.0.0.1", 0), CcCoderGatewayHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -153,6 +164,53 @@ def test_gateway_run_endpoint_converts_system_exit_to_json_error(monkeypatch) ->
         assert status == 500
         assert payload["ok"] is False
         assert "missing config" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_gateway_run_endpoint_rejects_missing_or_wrong_token(monkeypatch) -> None:
+    from http.server import ThreadingHTTPServer
+
+    from cc_code.gateway import CcCoderGatewayHandler
+
+    monkeypatch.setenv("CC_CODE_GATEWAY_TOKEN", _GATEWAY_TEST_TOKEN)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CcCoderGatewayHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, payload = _post_gateway_json(
+            server.server_address[1], {"prompt": "hello"}, token=None
+        )
+        assert status == 401
+        assert payload["ok"] is False
+
+        status, _ = _post_gateway_json(
+            server.server_address[1], {"prompt": "hello"}, token="wrong"
+        )
+        assert status == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_gateway_run_endpoint_disabled_without_token_config(monkeypatch) -> None:
+    from http.server import ThreadingHTTPServer
+
+    from cc_code.gateway import CcCoderGatewayHandler
+
+    monkeypatch.delenv("CC_CODE_GATEWAY_TOKEN", raising=False)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CcCoderGatewayHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, payload = _post_gateway_json(
+            server.server_address[1], {"prompt": "hello"}, token=None
+        )
+        assert status == 503
+        assert payload["ok"] is False
     finally:
         server.shutdown()
         server.server_close()

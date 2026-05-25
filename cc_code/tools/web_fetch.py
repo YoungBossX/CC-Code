@@ -11,8 +11,28 @@ MAX_CONTENT_LENGTH = 50000
 MAX_REDIRECTS = 5  # 限制重定向次数防止 SSRF
 
 
+def _ip_is_blocked(ip: str) -> bool:
+    """判断一个 IP 字面量是否落在禁止访问的范围内。"""
+    try:
+        addr = ip_address(ip)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local      # 含 169.254.0.0/16 云元数据网段
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
 def _is_safe_url(url: str) -> tuple[bool, str]:
-    """检查 URL 是否安全（非内网地址）"""
+    """检查 URL 是否安全（非内网/元数据地址）。
+
+    除字符串层面的快速拒绝外，会对主机名做 DNS 解析并逐个校验真实 IP，
+    防止「普通域名解析到内网」这类绕过。
+    """
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -23,7 +43,7 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
 
         hostname_lower = hostname.lower()
 
-        # 阻止本地和內网地址
+        # 阻止本地和內网地址（字面量快速拒绝）
         blocked_prefixes = [
             "localhost", "127.", "10.", "192.168.", "172.16.", "0.0.0.0",
             "::1", "fe80:", "fc00:", "fd00:", "::ffff:127.", "::ffff:0:",
@@ -46,19 +66,23 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
             return False, f"Access to DNS rebinding host blocked: {hostname}"
 
         # 阻止八进制 IP 表示绕过（如 0177.0.0.1）
-        # 如果 hostname 看起来像数字但包含前导零
         parts = hostname_lower.split(".")
         if len(parts) == 4 and all(p and p.isdigit() for p in parts):
             if any(p.startswith("0") and len(p) > 1 for p in parts):
                 return False, f"Access to octal IP notation blocked: {hostname}"
-            # 额外检查：用 ipaddress 解析看是否为内网地址
-            try:
-                from ipaddress import ip_address
-                addr = ip_address(hostname)
-                if addr.is_private or addr.is_loopback or addr.is_link_local:
-                    return False, f"Access to internal IP blocked: {hostname}"
-            except ValueError:
-                pass
+
+        # 关键防护：解析主机名得到真实 IP，逐个校验。
+        # 这同时覆盖了「域名指向内网」「十进制/十六进制整数 IP」等绕过形式。
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except OSError as e:
+            return False, f"DNS resolution failed for {hostname}: {e}"
+        resolved = {info[4][0] for info in infos}
+        if not resolved:
+            return False, f"No IP resolved for {hostname}"
+        for ip in resolved:
+            if _ip_is_blocked(ip):
+                return False, f"Hostname {hostname} resolves to blocked address {ip}"
 
         return True, "OK"
     except Exception as e:
@@ -104,6 +128,12 @@ def _run(input_data: dict, context) -> ToolResult:
                 self.redirect_count += 1
                 if self.redirect_count > MAX_REDIRECTS:
                     raise urllib.error.HTTPError(req.full_url, code, f"Too many redirects (>{MAX_REDIRECTS})", msg, fp)
+                # SSRF 防护：重定向目标必须重新校验，防止 302 跳转到内网/元数据
+                is_safe, reason = _is_safe_url(newurl)
+                if not is_safe:
+                    raise urllib.error.HTTPError(
+                        req.full_url, code, f"Unsafe redirect blocked: {reason}", msg, fp
+                    )
                 return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
 
         opener = urllib.request.build_opener(LimitedRedirectHandler())

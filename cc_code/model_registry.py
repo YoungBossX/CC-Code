@@ -291,14 +291,18 @@ def build_provider_config(model: str, runtime: dict | None = None) -> ProviderCo
         )
 
     if provider == Provider.CUSTOM:
+        # detect_provider 会在「vendor 前缀模型 + openaiBaseUrl」时归类为 CUSTOM，
+        # 因此这里也要把 openaiBaseUrl / openaiApiKey 作为回退源，否则 base_url 为空。
         base_url = (
             os.environ.get("CUSTOM_API_BASE_URL", "")
             or runtime.get("customBaseUrl", "")
+            or runtime.get("openaiBaseUrl", "")
         ).rstrip("/")
         api_key = (
             os.environ.get("CUSTOM_API_KEY", "")
             or os.environ.get("OPENAI_API_KEY", "")
             or runtime.get("customApiKey", "")
+            or runtime.get("openaiApiKey", "")
         )
         return ProviderConfig(
             provider=Provider.CUSTOM,
@@ -467,11 +471,13 @@ def format_model_status(model: str, runtime: dict | None = None) -> str:
     info = resolve_model_info(model, provider)
     pconfig = build_provider_config(model, runtime)
 
+    # 显示「实际生效」的 provider（与 Base URL 同源），而非 catalog 里的静态归类，
+    # 否则像 deepseek/deepseek-r1 + openaiBaseUrl 这种会出现 provider 与 base_url 矛盾。
     lines = [
         "Current Model",
         "=" * 50,
         f"  Model:    {info.display_name}",
-        f"  Provider: {info.provider.value}",
+        f"  Provider: {pconfig.provider.value}",
         f"  Base URL: {pconfig.base_url}",
         f"  Context:  {info.context_window:,} tokens",
         f"  Pricing:  ${info.pricing_input:.2f} / ${info.pricing_output:.2f} (in/out per 1M)",

@@ -36,7 +36,7 @@ services:
       # Mount workspace (current directory by default)
       - ${CC_CODE_WORKSPACE:-.}:/workspace
       # Persist user-level config, memory, skills across containers
-      - cc-coder-home:/home/cc_code/.cc-code
+      - cc-coder-home:/home/cc-coder/.cc-code
     working_dir: /workspace
 
   # ===========================================================================
@@ -57,6 +57,9 @@ services:
       - CC_CODE_GATEWAY=1
       - CC_CODE_GATEWAY_PORT=8080
       - CC_CODE_GATEWAY_HOST=0.0.0.0
+      # Shared secret required for POST /run (Authorization: Bearer <token>).
+      # When unset, /run is disabled and returns 503.
+      - CC_CODE_GATEWAY_TOKEN=${CC_CODE_GATEWAY_TOKEN:-}
       - CC_CODE_LOG_LEVEL=${CC_CODE_LOG_LEVEL:-INFO}
       # Platform tokens (set in .env or environment)
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
@@ -64,7 +67,7 @@ services:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
     volumes:
       - ${CC_CODE_WORKSPACE:-.}:/workspace
-      - cc-coder-home:/home/cc_code/.cc-code
+      - cc-coder-home:/home/cc-coder/.cc-code
     working_dir: /workspace
     restart: unless-stopped
     healthcheck:
@@ -92,7 +95,7 @@ services:
       - CC_CODE_LOG_LEVEL=${CC_CODE_LOG_LEVEL:-INFO}
     volumes:
       - ${CC_CODE_WORKSPACE:-.}:/workspace
-      - cc-coder-home:/home/cc_code/.cc-code
+      - cc-coder-home:/home/cc-coder/.cc-code
     working_dir: /workspace
     restart: unless-stopped
 
@@ -113,7 +116,7 @@ services:
       - CC_CODE_LOG_LEVEL=${CC_CODE_LOG_LEVEL:-WARNING}
     volumes:
       - ${CC_CODE_WORKSPACE:-.}:/workspace
-      - cc-coder-home:/home/cc_code/.cc-code
+      - cc-coder-home:/home/cc-coder/.cc-code
     working_dir: /workspace
 
 # =============================================================================
